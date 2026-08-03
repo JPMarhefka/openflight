@@ -174,6 +174,11 @@ class OPS243Radar:
     # 4096 I + 4096 Q samples, plus margin for whitespace and timing lines.
     DUMP_BYTES = 45000
 
+    # SZ firmware can emit speed/magnitude records after its WindowFunction
+    # and correction-factor metadata.  Treat that metadata as a lower bound,
+    # then wait for a quiet gap so the re-arm path does not discard the tail.
+    SZ_COMPLETION_QUIET_S = 0.75
+
     # Bound every serial write. A radar that is mid-dump (e.g. HOST_INT
     # re-asserted by the ball hitting the net) stops servicing commands;
     # without a write timeout, serial.write() blocks the capture thread
@@ -969,9 +974,11 @@ class OPS243Radar:
     def _capture_has_sz_completion_marker(response: str) -> bool:
         """Return whether SZ ended with its two firmware metadata records.
 
-        The correction-factor record is expected to be the final JSON object.
-        Requiring it to be last avoids stopping early when an older firmware
-        response places WindowFunction metadata before board records.
+        The correction-factor record is the completion lower bound for the
+        current response snapshot. Requiring it to be last avoids marking
+        completion early when an older firmware response places WindowFunction
+        metadata before board records; the reader still waits for a quiet gap
+        because some firmware emits more records afterward.
         """
         window_seen = False
         correction_seen = False
@@ -1404,6 +1411,7 @@ class OPS243Radar:
         read_deadline = start_time + timeout
         last_data_time = start_time
         q_complete = False
+        sz_completion_seen = False
         bytes_received = 0
         consecutive_read_errors = 0
         self.last_capture_receive_error = None
@@ -1438,21 +1446,33 @@ class OPS243Radar:
                 last_data_time = time.time()
 
                 # Q is final only for Sz/I-Q-only responses. SZ appends board
-                # records and ends with WindowFunction plus the correction
-                # factor, so keep reading after Q until that marker arrives.
+                # records and metadata; the metadata marker is not always the
+                # final bytes on every firmware revision, so continue until a
+                # quiet gap after the marker.
                 full_response = "".join(response_lines)
                 q_complete = q_complete or self._capture_has_complete_q(full_response)
                 if q_complete and self._capture_response_complete(full_response, q_complete):
-                    break
+                    processing_enabled = self._capture_processing_enabled_from_response(
+                        full_response
+                    )
+                    if processing_enabled is None:
+                        processing_enabled = bool(
+                            getattr(self, "_continuous_sampling_processing_enabled", False)
+                        )
+                    if processing_enabled:
+                        sz_completion_seen = True
+                    else:
+                        break
                 if q_complete:
                     # Allow the board's frame-window records to drain after Q.
                     read_deadline = max(read_deadline, time.time() + 8.0)
 
                 time.sleep(0.01)  # Short sleep to accumulate data
             else:
-                # No data available
-                # If we've received some data and haven't gotten more in 0.5s, consider done
-                if q_complete and (time.time() - last_data_time) > 0.5:
+                # No data available.  For SZ, require a quiet gap after the
+                # completion marker because more board records can follow it.
+                quiet_period = self.SZ_COMPLETION_QUIET_S if sz_completion_seen else 0.5
+                if q_complete and (time.time() - last_data_time) > quiet_period:
                     full_response = "".join(response_lines)
                     break
                 time.sleep(0.02)
@@ -1479,7 +1499,10 @@ class OPS243Radar:
         return full_response
 
     def wait_for_hardware_trigger(
-        self, timeout: float = 30.0, dump_grace: Optional[float] = None
+        self,
+        timeout: float = 30.0,
+        dump_grace: Optional[float] = None,
+        board_processing_enabled: Optional[bool] = None,
     ) -> str:
         """
         Wait for hardware trigger to fire and read the buffer dump.
@@ -1498,6 +1521,9 @@ class OPS243Radar:
                 The combined I/Q + SZ dump can exceed 10 seconds at 57,600
                 baud; a trigger firing near the end of the timeout must not
                 be cut off by the original deadline.
+            board_processing_enabled: Explicitly select the response mode.
+                True drains trailing SZ output, False stops at Q, and None
+                uses the firmware marker or the driver's configured state.
 
         Returns:
             Raw response string containing JSON lines, or empty string on timeout
@@ -1516,6 +1542,7 @@ class OPS243Radar:
         deadline = start_time + timeout
         last_data_time = None
         q_complete = False
+        sz_completion_seen = False
         bytes_received = 0
         self.last_hardware_trigger_first_byte_timestamp = None
 
@@ -1539,19 +1566,32 @@ class OPS243Radar:
                     last_data_time = time.time()
 
                 # Q is final only for Sz/I-Q-only responses. SZ appends board
-                # records and ends with WindowFunction plus the correction
-                # factor, so keep reading after Q until that marker arrives.
+                # records and metadata; the metadata marker is not always the
+                # final bytes on every firmware revision, so continue until a
+                # quiet gap after the marker.
                 full_response = "".join(response_lines)
                 q_complete = q_complete or self._capture_has_complete_q(full_response)
                 if q_complete and self._capture_response_complete(full_response, q_complete):
-                    break
+                    processing_enabled = board_processing_enabled
+                    if processing_enabled is None:
+                        processing_enabled = self._capture_processing_enabled_from_response(
+                            full_response
+                        )
+                        if processing_enabled is None:
+                            processing_enabled = bool(
+                                getattr(self, "_continuous_sampling_processing_enabled", False)
+                            )
+                    if processing_enabled:
+                        sz_completion_seen = True
+                    else:
+                        break
                 if q_complete:
                     deadline = max(deadline, time.time() + dump_grace)
 
                 time.sleep(0.01)
             else:
-                # If we've started receiving data, use shorter timeout
-                if q_complete and last_data_time and (time.time() - last_data_time) > 0.5:
+                quiet_period = self.SZ_COMPLETION_QUIET_S if sz_completion_seen else 0.5
+                if q_complete and last_data_time and (time.time() - last_data_time) > quiet_period:
                     break
                 time.sleep(0.02)
 

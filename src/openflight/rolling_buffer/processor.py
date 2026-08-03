@@ -176,6 +176,7 @@ class RollingBufferProcessor:
         self,
         response: str,
         first_byte_timestamp: Optional[float] = None,
+        board_processing_enabled: Optional[bool] = None,
     ) -> Optional[IQCapture]:
         """
         Parse S! command response into IQCapture object.
@@ -192,6 +193,9 @@ class RollingBufferProcessor:
             response: Raw response string from S! command
             first_byte_timestamp: Host epoch timestamp when the first byte
                 arrived from a hardware-triggered rolling-buffer dump.
+            board_processing_enabled: Explicitly select the parser mode. True
+                parses SZ speed/magnitude output, False treats the response as
+                I/Q-only, and None auto-detects the mode from firmware output.
 
         Returns:
             IQCapture object or None if parsing fails
@@ -203,7 +207,8 @@ class RollingBufferProcessor:
             q_samples = None
             board_records: List[BoardSpeedMagnitudeRecord] = []
             board_metadata: List[dict] = []
-            board_processing_enabled = False
+            detected_board_processing_enabled = False
+            parse_board_output = board_processing_enabled is not False
 
             for line in response.strip().split("\n"):
                 line = line.strip()
@@ -224,6 +229,8 @@ class RollingBufferProcessor:
                     elif "Q" in data:
                         q_samples = data["Q"]
                     elif {"time", "speed", "magnitude"}.issubset(data):
+                        if not parse_board_output:
+                            continue
                         try:
                             speeds = data["speed"]
                             magnitudes = data["magnitude"]
@@ -246,7 +253,9 @@ class RollingBufferProcessor:
                             board_records.append(
                                 BoardSpeedMagnitudeRecord(
                                     timestamp=float(data["time"]),
-                                    unit=(str(data["unit"]) if data.get("unit") is not None else None),
+                                    unit=(
+                                        str(data["unit"]) if data.get("unit") is not None else None
+                                    ),
                                     magnitudes=magnitudes,
                                     speeds=speeds,
                                 )
@@ -258,7 +267,7 @@ class RollingBufferProcessor:
                                 "[PROCESSOR] Ignoring malformed board speed/magnitude record: %s",
                                 error,
                             )
-                    else:
+                    elif parse_board_output:
                         board_metadata.append(data)
                         metadata_text = " ".join(
                             f"{key}={value}" for key, value in data.items()
@@ -267,7 +276,7 @@ class RollingBufferProcessor:
                             "continuous" in metadata_text
                             and ("enabled" in metadata_text or "processing" in metadata_text)
                         ):
-                            board_processing_enabled = True
+                            detected_board_processing_enabled = True
 
                 except json.JSONDecodeError:
                     continue
@@ -293,7 +302,11 @@ class RollingBufferProcessor:
                 frame_tolerance = max(self.WINDOW_SIZE / self.SAMPLE_RATE, 0.01)
                 valid_board_records = []
                 for record in board_records:
-                    if sample_time - frame_tolerance <= record.timestamp <= capture_end_time + frame_tolerance:
+                    if (
+                        sample_time - frame_tolerance
+                        <= record.timestamp
+                        <= capture_end_time + frame_tolerance
+                    ):
                         valid_board_records.append(record)
                     else:
                         logger.warning(
@@ -305,13 +318,18 @@ class RollingBufferProcessor:
                         )
                 # Some SZ firmware emits only the time/speed/magnitude records
                 # and omits the explicit ContinuousSampling status line.
-                board_processing_enabled = board_processing_enabled or bool(valid_board_records)
+                if board_processing_enabled is None:
+                    processing_enabled = detected_board_processing_enabled or bool(
+                        valid_board_records
+                    )
+                else:
+                    processing_enabled = board_processing_enabled
                 board_timeline = BoardProcessedTimeline(
                     records=valid_board_records,
                     metadata=board_metadata,
                     sample_time=sample_time,
                     trigger_time=trigger_time,
-                    processing_enabled=board_processing_enabled,
+                    processing_enabled=processing_enabled,
                 )
                 return IQCapture(
                     sample_time=sample_time,

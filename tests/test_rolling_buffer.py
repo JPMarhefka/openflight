@@ -484,6 +484,31 @@ class TestRollingBufferProcessor:
         assert capture.board_timeline.records[0].timestamp == pytest.approx(21.120)
         assert capture.board_timeline.records[0].speeds == [55.3]
 
+    def test_parse_capture_explicit_board_processing_flag(self, processor):
+        """The parser follows the same enabled/disabled mode as the radar."""
+        response = "\n".join(
+            [
+                '{"ContinuousSampling":"Process Continuous Sampling Raw Data enabled"}',
+                '{"sample_time":1.0}',
+                '{"trigger_time":1.1}',
+                f'{{"I":{json.dumps([2048] * 4096)}}}',
+                f'{{"Q":{json.dumps([2048] * 4096)}}}',
+                '{"time":1.12,"unit":"mps","magnitude":[2.0],"speed":[3.0]}',
+            ]
+        )
+
+        enabled_capture = processor.parse_capture(response, board_processing_enabled=True)
+        disabled_capture = processor.parse_capture(response, board_processing_enabled=False)
+
+        assert enabled_capture is not None
+        assert enabled_capture.board_timeline is not None
+        assert enabled_capture.board_timeline.processing_enabled is True
+        assert enabled_capture.board_timeline.record_count == 1
+        assert disabled_capture is not None
+        assert disabled_capture.board_timeline is not None
+        assert disabled_capture.board_timeline.processing_enabled is False
+        assert disabled_capture.board_timeline.record_count == 0
+
     def test_parse_capture_records_first_byte_timestamp(self, processor):
         """Parser should preserve first-byte time and infer trigger epoch."""
         i_samples = [2048] * 4096
@@ -760,6 +785,7 @@ class TestSoundTriggerTimestampPropagation:
         )
         monkeypatch.setattr(time, "sleep", lambda _seconds: None)
         trigger = HardwareTriggeredCapture(trigger_threshold_mph=25, pre_trigger_segments=16)
+        trigger.board_processing_enabled = True
 
         result = trigger.wait_for_trigger(radar, processor, timeout=1.0)
 
@@ -767,6 +793,7 @@ class TestSoundTriggerTimestampPropagation:
         processor.parse_capture.assert_called_once_with(
             '{"sample_time": 0.0}',
             first_byte_timestamp=12345.678,
+            board_processing_enabled=True,
         )
         radar.rearm_internal_speed_trigger.assert_called_once_with(30)
         # A received dump is not yet a successful shot.  The monitor emits
@@ -1104,7 +1131,9 @@ class TestSpeedTriggeredCapture:
         )
         radar.trigger_capture.return_value = "raw"
         processor = MagicMock()
-        processor.parse_capture.side_effect = lambda _response: events.append("parsed") or capture
+        processor.parse_capture.side_effect = (
+            lambda _response, **_kwargs: events.append("parsed") or capture
+        )
         processor.process_standard.return_value = SpeedTimeline(
             readings=[SpeedReading(20.0, 10.0, 0.0, "outbound")],
             sample_rate_hz=937.5,

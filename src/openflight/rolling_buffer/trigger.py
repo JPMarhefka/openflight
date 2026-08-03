@@ -59,6 +59,35 @@ class TriggerStrategy(ABC):
     def __init__(self, pre_trigger_segments: int = 12):
         self._diagnostics: List[dict] = []
         self.pre_trigger_segments = pre_trigger_segments
+        # The monitor sets this explicitly so the parser follows the same
+        # board-processing mode as the radar configuration.
+        self.board_processing_enabled: Optional[bool] = None
+
+    def _wait_for_hardware_trigger(
+        self,
+        radar: "OPS243Radar",
+        timeout: float,
+    ) -> str:
+        """Wait for a dump while preserving auto-detection for direct callers."""
+        wait_kwargs = {"timeout": timeout}
+        if self.board_processing_enabled is not None:
+            wait_kwargs["board_processing_enabled"] = self.board_processing_enabled
+        return radar.wait_for_hardware_trigger(**wait_kwargs)
+
+    def _parse_capture(
+        self,
+        processor: RollingBufferProcessor,
+        response: str,
+        *,
+        first_byte_timestamp: Optional[float] = None,
+    ) -> Optional[IQCapture]:
+        """Parse a capture using this trigger's explicit board mode."""
+        parse_kwargs = {}
+        if first_byte_timestamp is not None:
+            parse_kwargs["first_byte_timestamp"] = first_byte_timestamp
+        if self.board_processing_enabled is not None:
+            parse_kwargs["board_processing_enabled"] = self.board_processing_enabled
+        return processor.parse_capture(response, **parse_kwargs)
 
     def drain_diagnostics(self) -> List[dict]:
         """Return and clear accumulated diagnostic entries.
@@ -238,7 +267,7 @@ class PollingTrigger(TriggerStrategy):
                 radar.rearm_rolling_buffer(self.pre_trigger_segments)
 
                 # Parse response
-                capture = processor.parse_capture(response)
+                capture = self._parse_capture(processor, response)
 
                 if capture is None:
                     time.sleep(self.poll_interval)
@@ -332,7 +361,7 @@ class ThresholdTrigger(TriggerStrategy):
                 # Re-arm for next capture
                 radar.rearm_rolling_buffer(self.pre_trigger_segments)
 
-                capture = processor.parse_capture(response)
+                capture = self._parse_capture(processor, response)
 
                 if capture is None:
                     time.sleep(self.check_interval)
@@ -356,7 +385,7 @@ class ThresholdTrigger(TriggerStrategy):
                     # Capture again for complete swing data
                     response = radar.trigger_capture(timeout=10.0)
                     radar.rearm_rolling_buffer(self.pre_trigger_segments)
-                    final_capture = processor.parse_capture(response)
+                    final_capture = self._parse_capture(processor, response)
 
                     return final_capture or capture
 
@@ -406,7 +435,7 @@ class ManualTrigger(TriggerStrategy):
 
                 response = radar.trigger_capture(timeout=10.0)
                 radar.rearm_rolling_buffer(self.pre_trigger_segments)
-                return processor.parse_capture(response)
+                return self._parse_capture(processor, response)
 
             time.sleep(0.1)
 
@@ -585,7 +614,7 @@ class SpeedTriggeredCapture(TriggerStrategy):
                     delay_sec = self.trigger_to_capture_delay_ms / 1000.0
                     time.sleep(delay_sec)
                     response = radar.trigger_capture(timeout=self.CAPTURE_RECEIVE_TIMEOUT_SEC)
-                    capture = processor.parse_capture(response)
+                    capture = self._parse_capture(processor, response)
 
                     # Capture timing ends when the full UART response has been
                     # parsed.  Save the complete raw buffer before restoring
@@ -867,7 +896,7 @@ class GPIOSoundTrigger(TriggerStrategy):
                 logger.debug("[TRIGGER] Discarding GPIO edges during re-arm")
                 self._trigger_event["triggered"] = False  # discard edges during rearm
 
-                capture = processor.parse_capture(response)
+                capture = self._parse_capture(processor, response)
 
                 if not capture:
                     logger.warning("[TRIGGER] Failed to parse capture (%d bytes)", response_len)
@@ -1191,7 +1220,7 @@ class SoundTrigger(TriggerStrategy):
         """
         logger.info("[TRIGGER] Waiting for sound trigger (timeout=%.0fs)...", timeout)
 
-        response = radar.wait_for_hardware_trigger(timeout=timeout)
+        response = self._wait_for_hardware_trigger(radar, timeout)
 
         if not response:
             logger.info("[TRIGGER] Sound trigger timeout — no hardware trigger received")
@@ -1214,7 +1243,8 @@ class SoundTrigger(TriggerStrategy):
         # mid-dump). So: do all wire-talk (clock sync) while idle, and
         # re-arm LAST, when we are about to go back to reading.
 
-        capture = processor.parse_capture(
+        capture = self._parse_capture(
+            processor,
             response,
             first_byte_timestamp=first_byte_timestamp,
         )
@@ -1332,14 +1362,15 @@ class HardwareTriggeredCapture(SoundTrigger):
             timeout,
         )
         started_at = time.time()
-        response = radar.wait_for_hardware_trigger(timeout=timeout)
+        response = self._wait_for_hardware_trigger(radar, timeout)
         if not response:
             logger.info("[TRIGGER] OPS hardware trigger timeout — no dump received")
             return None
 
         response_bytes = len(response)
         first_byte_timestamp = getattr(radar, "last_hardware_trigger_first_byte_timestamp", None)
-        capture = processor.parse_capture(
+        capture = self._parse_capture(
+            processor,
             response,
             first_byte_timestamp=first_byte_timestamp,
         )

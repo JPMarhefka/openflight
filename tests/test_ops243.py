@@ -227,7 +227,7 @@ class TestSpeedTriggerConfiguration:
         assert commands == ["GC", "S#0", "rate:30000", "Sz"]
         assert sleeps == [0.02, 0.02, 0.02]
 
-    def test_hardware_trigger_reader_keeps_sz_records_after_q_array(self, monkeypatch):
+    def test_hardware_trigger_reader_keeps_sz_records_after_q_array(self):
         """Hardware-trigger reads must not stop at the end of the Q array."""
         radar = OPS243Radar.__new__(OPS243Radar)
         radar._continuous_sampling_processing_enabled = True
@@ -242,6 +242,7 @@ class TestSpeedTriggerConfiguration:
                     b'{"time":1.12,"unit":"mph","magnitude":[100],"speed":[35]}\n',
                     b'{"WindowFunction":"Generated Hann Window"}\n',
                     b'{"windowing_amplitude_correction_factor":2.0020}\n',
+                    b'{"time":1.13,"unit":"mph","magnitude":[90],"speed":[32]}\n',
                 ]
 
             @property
@@ -255,12 +256,12 @@ class TestSpeedTriggerConfiguration:
                 pass
 
         radar.serial = FakeSerial()
-        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
 
         response = radar.wait_for_hardware_trigger(timeout=1.0, dump_grace=1.0)
 
         assert '"Q":[2]' in response
         assert '"speed":[35]' in response
+        assert '"speed":[32]' in response
         assert '"windowing_amplitude_correction_factor":2.002' in response
 
     def test_iq_only_reader_uses_q_as_end_marker(self, monkeypatch):
