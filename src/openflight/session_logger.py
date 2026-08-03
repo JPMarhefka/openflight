@@ -894,6 +894,12 @@ class SessionLogger:
         trigger_timestamp_source: Optional[str] = None,
         clock_sync_offset_s: Optional[float] = None,
         post_trigger_duration_ms: Optional[float] = None,
+        board_output_file: Optional[str] = None,
+        board_record_count: Optional[int] = None,
+        board_processing_enabled: Optional[bool] = None,
+        board_unit: Optional[str] = None,
+        board_peak_speed: Optional[float] = None,
+        board_peak_magnitude: Optional[float] = None,
     ):
         """
         Log raw rolling buffer capture data for offline analysis.
@@ -950,6 +956,12 @@ class SessionLogger:
             trigger_timestamp_source: Method used to infer trigger_timestamp
             clock_sync_offset_s: Host epoch minus OPS radar clock, when available
             post_trigger_duration_ms: Duration of the capture after trigger
+            board_output_file: Per-shot board speed/magnitude JSONL path
+            board_record_count: Number of board-produced records
+            board_processing_enabled: Whether board processing was enabled
+            board_unit: Native board speed unit
+            board_peak_speed: Largest absolute board speed in native units
+            board_peak_magnitude: Largest board magnitude
         """
         if not self.enabled:
             return
@@ -1005,6 +1017,12 @@ class SessionLogger:
                 ),
                 "clock_sync_offset_s": clock_sync_offset_s,
                 "post_trigger_duration_ms": post_trigger_duration_ms,
+                "board_output_file": board_output_file,
+                "board_record_count": board_record_count,
+                "board_processing_enabled": board_processing_enabled,
+                "board_unit": board_unit,
+                "board_peak_speed": board_peak_speed,
+                "board_peak_magnitude": board_peak_magnitude,
                 "smash_factor": smash_factor,
                 "spin_rpm": spin_rpm,
                 "spin_confidence": spin_confidence,

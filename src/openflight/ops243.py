@@ -220,6 +220,14 @@ class OPS243Radar:
         self._unit = "mph"
         self._json_mode = False
         self._magnitude_enabled = False
+        self._continuous_sampling_processing_enabled = False
+        # UART reads can split one JSON report across multiple USB packets.
+        # Keep the incomplete tail until its line terminator arrives.
+        self._speed_read_buffer = ""
+        # Set by trigger_capture() when a USB/UART read race occurs. The
+        # speed trigger uses it to classify a failed raw capture without
+        # crashing kiosk mode.
+        self.last_capture_receive_error: Optional[str] = None
         self.last_hardware_trigger_first_byte_timestamp: Optional[float] = None
         # Most recent OPS-clock -> host-epoch sync (see read_clock_sync).
         self.last_clock_sync: Optional[dict] = None
@@ -917,6 +925,92 @@ class OPS243Radar:
         self._send_command("OM" if enabled else "Om")
         self._magnitude_enabled = enabled
 
+    def set_continuous_sampling_processing(self, enabled: bool = True) -> str:
+        """Enable or disable OPS continuous-sampling frame-window processing."""
+        response = self._send_command("SZ" if enabled else "Sz")
+        self._continuous_sampling_processing_enabled = enabled
+        logger.info(
+            "[OPS] Continuous Sampling Raw Data processing %s",
+            "enabled (SZ)" if enabled else "disabled (Sz)",
+        )
+        return response
+
+    @staticmethod
+    def _capture_has_complete_q(response: str) -> bool:
+        """Return whether the JSON Q array is complete in a capture response."""
+        q_index = response.rfind('"Q"')
+        if q_index < 0:
+            return False
+        remaining = response[q_index:]
+        return "]}" in remaining or (
+            remaining.rstrip().endswith("]")
+            and remaining.count("[") == remaining.count("]")
+        )
+
+    @staticmethod
+    def _capture_processing_enabled_from_response(response: str) -> Optional[bool]:
+        """Read an explicit ContinuousSampling status marker when present."""
+        status: Optional[bool] = None
+        for line in response.splitlines():
+            try:
+                payload = json.loads(line.strip())
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict) or "ContinuousSampling" not in payload:
+                continue
+            value = str(payload["ContinuousSampling"]).lower()
+            if "enabled" in value:
+                status = True
+            elif "disabled" in value:
+                status = False
+        return status
+
+    @staticmethod
+    def _capture_has_sz_completion_marker(response: str) -> bool:
+        """Return whether SZ ended with its two firmware metadata records.
+
+        The correction-factor record is expected to be the final JSON object.
+        Requiring it to be last avoids stopping early when an older firmware
+        response places WindowFunction metadata before board records.
+        """
+        window_seen = False
+        correction_seen = False
+        last_payload = None
+        for line in response.splitlines():
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line.strip())
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            last_payload = payload
+            window_seen = window_seen or "WindowFunction" in payload
+            correction_seen = correction_seen or "windowing_amplitude_correction_factor" in payload
+        return (
+            window_seen
+            and correction_seen
+            and isinstance(last_payload, dict)
+            and "windowing_amplitude_correction_factor" in last_payload
+        )
+
+    def _capture_response_complete(self, response: str, q_complete: bool) -> bool:
+        """Apply the mode-specific end condition to a combined response."""
+        if not q_complete:
+            return False
+        explicit_mode = self._capture_processing_enabled_from_response(response)
+        processing_enabled = (
+            explicit_mode
+            if explicit_mode is not None
+            else bool(getattr(self, "_continuous_sampling_processing_enabled", False))
+        )
+        if not processing_enabled:
+            # In Sz/I-Q-only mode Q is the final payload.
+            return True
+        # In SZ mode Q is followed by board records and final metadata.
+        return self._capture_has_sz_completion_marker(response)
+
     def set_transmit_power(self, level: int):
         """
         Set transmit power level.
@@ -1307,37 +1401,60 @@ class OPS243Radar:
 
         response_lines = []
         start_time = time.time()
+        read_deadline = start_time + timeout
         last_data_time = start_time
+        q_complete = False
         bytes_received = 0
+        consecutive_read_errors = 0
+        self.last_capture_receive_error = None
 
         # Read data until timeout or complete response
-        while (time.time() - start_time) < timeout:
-            if self.serial.in_waiting:
-                chunk = self.serial.read(self.serial.in_waiting)
+        while time.time() < read_deadline:
+            try:
+                bytes_waiting = self.serial.in_waiting
+                chunk = self.serial.read(bytes_waiting) if bytes_waiting else b""
+                if bytes_waiting and not chunk:
+                    raise serial.SerialException("serial read returned no data")
+            except (OSError, serial.SerialException) as error:
+                consecutive_read_errors += 1
+                self.last_capture_receive_error = str(error)
+                # A USB readiness race can be transient. Keep retrying through
+                # the normal capture deadline, but avoid flooding the terminal
+                # if the device has genuinely disappeared.
+                if consecutive_read_errors == 1 or consecutive_read_errors % 50 == 0:
+                    logger.warning(
+                        "[OPS] S! serial read failed (%d consecutive; retrying): %s",
+                        consecutive_read_errors,
+                        error,
+                    )
+                time.sleep(0.02)
+                continue
+
+            if bytes_waiting:
+                consecutive_read_errors = 0
+                self.last_capture_receive_error = None
                 response_lines.append(chunk.decode("ascii", errors="ignore"))
                 bytes_received += len(chunk)
                 last_data_time = time.time()
 
-                # Check if we have complete data (Q array ends the response)
+                # Q is final only for Sz/I-Q-only responses. SZ appends board
+                # records and ends with WindowFunction plus the correction
+                # factor, so keep reading after Q until that marker arrives.
                 full_response = "".join(response_lines)
-                if '"Q"' in full_response:
-                    # Look for closing bracket of Q array followed by newline or EOF
-                    q_idx = full_response.rfind('"Q"')
-                    remaining = full_response[q_idx:]
-                    if "]}" in remaining or (
-                        remaining.rstrip().endswith("]")
-                        and remaining.count("[") == remaining.count("]")
-                    ):
-                        break
+                q_complete = q_complete or self._capture_has_complete_q(full_response)
+                if q_complete and self._capture_response_complete(full_response, q_complete):
+                    break
+                if q_complete:
+                    # Allow the board's frame-window records to drain after Q.
+                    read_deadline = max(read_deadline, time.time() + 8.0)
 
                 time.sleep(0.01)  # Short sleep to accumulate data
             else:
                 # No data available
                 # If we've received some data and haven't gotten more in 0.5s, consider done
-                if bytes_received > 100 and (time.time() - last_data_time) > 0.5:
+                if q_complete and (time.time() - last_data_time) > 0.5:
                     full_response = "".join(response_lines)
-                    if '"Q"' in full_response:
-                        break
+                    break
                 time.sleep(0.02)
 
         full_response = "".join(response_lines)
@@ -1378,6 +1495,9 @@ class OPS243Radar:
                 timeout window must not have its dump cut off by the original
                 deadline. None derives it from baud (floor 8s): the ~40.6KB
                 dump takes ~1.8s over UART at 230,400 but 21s at 19,200.
+                The combined I/Q + SZ dump can exceed 10 seconds at 57,600
+                baud; a trigger firing near the end of the timeout must not
+                be cut off by the original deadline.
 
         Returns:
             Raw response string containing JSON lines, or empty string on timeout
@@ -1395,6 +1515,7 @@ class OPS243Radar:
         start_time = time.time()
         deadline = start_time + timeout
         last_data_time = None
+        q_complete = False
         bytes_received = 0
         self.last_hardware_trigger_first_byte_timestamp = None
 
@@ -1417,24 +1538,21 @@ class OPS243Radar:
                 else:
                     last_data_time = time.time()
 
-                # Check if we have complete I/Q data
+                # Q is final only for Sz/I-Q-only responses. SZ appends board
+                # records and ends with WindowFunction plus the correction
+                # factor, so keep reading after Q until that marker arrives.
                 full_response = "".join(response_lines)
-                if '"Q"' in full_response:
-                    q_idx = full_response.rfind('"Q"')
-                    remaining = full_response[q_idx:]
-                    if "]}" in remaining or (
-                        remaining.rstrip().endswith("]")
-                        and remaining.count("[") == remaining.count("]")
-                    ):
-                        break
+                q_complete = q_complete or self._capture_has_complete_q(full_response)
+                if q_complete and self._capture_response_complete(full_response, q_complete):
+                    break
+                if q_complete:
+                    deadline = max(deadline, time.time() + dump_grace)
 
                 time.sleep(0.01)
             else:
                 # If we've started receiving data, use shorter timeout
-                if last_data_time and (time.time() - last_data_time) > 0.5:
-                    full_response = "".join(response_lines)
-                    if '"Q"' in full_response:
-                        break
+                if q_complete and last_data_time and (time.time() - last_data_time) > 0.5:
+                    break
                 time.sleep(0.02)
 
         full_response = "".join(response_lines) if response_lines else ""
@@ -1536,11 +1654,128 @@ class OPS243Radar:
             )
             return
 
+        if getattr(self, "_continuous_sampling_processing_enabled", False):
+            self.set_continuous_sampling_processing(True)
         self.serial.reset_input_buffer()
         logger.info("[OPS] Rolling buffer re-armed (S#%d)", pre_trigger_segments)
 
+    def configure_for_internal_speed_trigger(
+        self,
+        trigger_threshold_mph: float = 25.0,
+        pre_trigger_segments: int = 16,
+        trigger_magnitude: int = 40,
+        sample_rate_ksps: int = 30,
+        process_continuous_sampling: bool = False,
+    ):
+        """Configure the OPS243's built-in speed-triggered rolling buffer.
+
+        This board firmware requires its rolling-buffer trigger commands in
+        the exact order ``PI -> STn -> GC -> S=n``.  The preceding commands
+        retain the detector settings previously used by OpenFlight's software
+        speed trigger, but the board—not the host—now decides when to dump
+        the rolling buffer.
+        """
+        if not self.serial or not self.serial.is_open:
+            raise ConnectionError("Not connected to radar")
+        if trigger_threshold_mph < 0:
+            raise ValueError("Trigger threshold must be non-negative")
+        if not 1 <= trigger_magnitude <= 2000:
+            raise ValueError("Trigger magnitude must be between 1 and 2000")
+        if sample_rate_ksps != 30:
+            raise ValueError("Internal speed trigger requires a 30 ksps sample rate")
+
+        pre_trigger_segments = max(0, min(32, pre_trigger_segments))
+        threshold = f"{trigger_threshold_mph:g}"
+        self._speed_read_buffer = ""
+        self.serial.reset_input_buffer()
+
+        # Required internal-trigger ordering.  ST does not contain one of the
+        # generic helper's CR-triggering characters, so terminate it directly.
+        self._send_command("PI")
+        self.serial.write(f"ST{threshold}\r".encode("ascii"))
+        self.serial.flush()
+        time.sleep(0.1)
+        self._send_command("GC")
+        self._internal_speed_trigger_config = (
+            trigger_threshold_mph,
+            pre_trigger_segments,
+            trigger_magnitude,
+            sample_rate_ksps,
+        )
+        self._restore_internal_speed_trigger_settings()
+        if process_continuous_sampling:
+            self.set_continuous_sampling_processing(True)
+        self.serial.reset_input_buffer()
+
+        # A complete 4,096-sample rolling buffer needs 136.5 ms at 30 ksps.
+        time.sleep(0.3)
+        logger.info(
+            "[OPS] Internal speed trigger armed (ST%s, S#%d, S=%d)",
+            threshold,
+            pre_trigger_segments,
+            sample_rate_ksps,
+        )
+
+    def _restore_internal_speed_trigger_settings(self):
+        """Restore settings that the board resets whenever ``GC`` is sent."""
+        trigger_threshold_mph, pre_trigger_segments, trigger_magnitude, sample_rate_ksps = (
+            self._internal_speed_trigger_config
+        )
+        threshold = f"{trigger_threshold_mph:g}"
+
+        # GC restores this firmware's detector defaults (m/s, 1,024-sample
+        # buffer, X=1, and cleared filters).  Restore the former OpenFlight
+        # detector configuration only after GC and S=30.  Re-sending ST after
+        # US keeps its numeric threshold in mph rather than the reset m/s unit.
+        self._send_command(f"S={sample_rate_ksps}")
+        self.set_units(SpeedUnit.MPH)
+        self.set_transmit_power(0)
+        self.set_buffer_size(128)
+        self.set_fft_size(2)
+        self._send_command("R-")
+        self._send_command(f"R>{threshold}")
+        self.enable_json_output(True)
+        self.enable_magnitude_report(True)
+        self._send_command("W0")
+        self._send_command(f"S#{pre_trigger_segments}")
+        self.serial.write(f"ST{threshold}\r".encode("ascii"))
+        self.serial.write(f"SM{trigger_magnitude}\r".encode("ascii"))
+        self.serial.flush()
+        time.sleep(0.1)
+
+    def rearm_internal_speed_trigger(self, sample_rate_ksps: int = 30):
+        """Re-arm the board-managed trigger after its complete I/Q dump.
+
+        The board firmware resumes internal rolling-buffer trigger mode on
+        ``GC``, but GC resets detector settings. Restore the cached hardware
+        trigger configuration afterward; never send ``PA`` or ``S#0``.
+        """
+        if not self.serial or not self.serial.is_open:
+            raise ConnectionError("Not connected to radar")
+        if sample_rate_ksps <= 0:
+            raise ValueError("Sample rate must be positive")
+
+        self.serial.reset_input_buffer()
+        self.serial.write(b"GC")
+        self.serial.flush()
+        if hasattr(self, "_internal_speed_trigger_config"):
+            self._restore_internal_speed_trigger_settings()
+        else:
+            logger.warning(
+                "[OPS] Internal trigger re-armed without cached configuration; "
+                "GC defaults remain active"
+            )
+        if getattr(self, "_continuous_sampling_processing_enabled", False):
+            self.set_continuous_sampling_processing(True)
+        # Let the newly armed rolling history fill before a club can trigger.
+        time.sleep((4096 / (sample_rate_ksps * 1000)) + 0.05)
+        logger.info("[OPS] Internal speed trigger re-armed (GC)")
+
     def configure_for_rolling_buffer(
-        self, pre_trigger_segments: int = 16, sample_rate_ksps: int = 30
+        self,
+        pre_trigger_segments: int = 16,
+        sample_rate_ksps: int = 30,
+        process_continuous_sampling: bool = False,
     ):
         """
         Configure radar optimally for rolling buffer mode.
@@ -1575,10 +1810,12 @@ class OPS243Radar:
         self.enter_rolling_buffer_mode(
             pre_trigger_segments=pre_trigger_segments, sample_rate_ksps=sample_rate_ksps
         )
+        if process_continuous_sampling:
+            self.set_continuous_sampling_processing(True)
 
         logger.info("[OPS] Rolling buffer mode configured")
 
-    def configure_for_speed_trigger(self):
+    def configure_for_speed_trigger(self, min_trigger_speed_mph: float = 25.0):
         """
         Configure radar for fast speed detection to trigger rolling buffer capture.
 
@@ -1586,7 +1823,7 @@ class OPS243Radar:
         - 30ksps sample rate
         - 128 buffer size
         - 256 FFT size (X=2) for ~150-200Hz report rate (5-6ms between reports)
-        - R>20 = minimum 20mph filter (eliminates leg movement, backswing noise)
+        - Configurable minimum speed filter (25mph by default)
         - R- = outbound only (ball/club going away from radar)
 
         This mode is used to detect the initial club swing, then we switch
@@ -1597,10 +1834,18 @@ class OPS243Radar:
         - ~5-6ms to switch to rolling buffer
         - Club to ball impact is 20-40ms, so we capture the ball
         """
-        logger.info("[OPS] Configuring for fast speed trigger mode...")
+        if min_trigger_speed_mph < 0:
+            raise ValueError("Minimum trigger speed must be non-negative")
+
+        logger.info(
+            "[OPS] Configuring for fast speed trigger mode (threshold > %.1f mph)...",
+            min_trigger_speed_mph,
+        )
+        self._speed_read_buffer = ""
 
         # Start from clean state
         self._send_command("GS")  # Ensure CW mode (not rolling buffer)
+        self._continuous_sampling_processing_enabled = False
         time.sleep(0.1)
 
         self._send_command("PI")  # Idle mode
@@ -1635,10 +1880,11 @@ class OPS243Radar:
         time.sleep(0.05)
         logger.info("[OPS] Direction filter: outbound only (R-)")
 
-        # Minimum speed 20mph - ignore leg movement and slow movements
-        self._send_command("R>20")
+        # Keep the hardware report filter aligned with the software trigger.
+        threshold = f"{min_trigger_speed_mph:g}"
+        self._send_command(f"R>{threshold}")
         time.sleep(0.05)
-        logger.info("[OPS] Min speed filter: 20 mph (R>20)")
+        logger.info("[OPS] Min speed filter: %s mph (R>%s)", threshold, threshold)
 
         # Enable JSON output for parsing
         self.enable_json_output(True)
@@ -1659,7 +1905,7 @@ class OPS243Radar:
         response = self._send_command("S?")
         logger.info("[OPS] Settings: %s", response)
 
-    def switch_to_rolling_buffer(self):
+    def switch_to_rolling_buffer(self, process_continuous_sampling: bool = False):
         """
         Quickly switch from speed detection mode to rolling buffer capture.
 
@@ -1681,6 +1927,8 @@ class OPS243Radar:
         # 30ksps sample rate (GC may reset to default)
         self.set_sample_rate(30000)
         time.sleep(0.02)
+        if process_continuous_sampling:
+            self.set_continuous_sampling_processing(True)
 
     def read_speed_nonblocking(self) -> Optional[SpeedReading]:
         """
@@ -1689,31 +1937,43 @@ class OPS243Radar:
         Returns immediately with a reading if one is available,
         or None if no complete line in buffer.
         """
-        if not self.serial or not self.serial.is_open:
-            return None
-
-        if self.serial.in_waiting == 0:
-            return None
-
         try:
-            # Read available data
-            raw_bytes = self.serial.read(self.serial.in_waiting)
-            line = raw_bytes.decode("ascii", errors="ignore").strip()
-
-            if not line:
+            if not self.serial or not self.serial.is_open:
                 return None
 
-            # May have multiple lines - take the last complete one
-            lines = line.split("\n")
-            for candidate in reversed(lines):
-                candidate = candidate.strip()
+            waiting = self.serial.in_waiting
+            if waiting == 0:
+                return None
+
+            raw_bytes = self.serial.read(waiting)
+            self._speed_read_buffer = (
+                getattr(self, "_speed_read_buffer", "")
+                + raw_bytes.decode("ascii", errors="ignore")
+            )
+
+            # Parse only complete CR/LF-delimited reports. The OPS243 UART can
+            # split a JSON message at an arbitrary byte boundary, so parsing an
+            # unterminated tail would discard the speed field before it arrives.
+            complete_lines = []
+            tail = ""
+            for line in self._speed_read_buffer.splitlines(keepends=True):
+                if line.endswith(("\r", "\n")):
+                    complete_lines.append(line.strip())
+                else:
+                    tail += line
+            self._speed_read_buffer = tail[-8192:]
+
+            # A single USB read may carry several reports; use the newest one.
+            for candidate in reversed(complete_lines):
                 if candidate.startswith("{"):
                     reading = self._parse_reading(candidate)
                     if reading:
                         return reading
 
             return None
-        except Exception:
+        except (OSError, serial.SerialException):
+            # The monitor may close the port while its capture thread is
+            # finishing a non-blocking poll during shutdown.
             return None
 
     def __enter__(self):

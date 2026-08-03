@@ -7,6 +7,7 @@ Based on OmniPreSense AN-027 Rolling Buffer application note.
 
 import json
 import logging
+import math
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
@@ -15,6 +16,8 @@ from scipy.signal import butter, find_peaks, sosfiltfilt
 from ..launch_monitor import SPIN_CONFIDENCE_HIGH, ClubType
 from .multitaper import estimate_multitaper_spin, repair_clipped_iq
 from .types import (
+    BoardProcessedTimeline,
+    BoardSpeedMagnitudeRecord,
     ImpactEstimate,
     IQCapture,
     ProcessedCapture,
@@ -182,6 +185,8 @@ class RollingBufferProcessor:
         {"trigger_time": "964.105"}
         {"I": [4096 integers...]}
         {"Q": [4096 integers...]}
+        Optional firmware/configuration and board speed/magnitude records may
+        appear before, between, or after those I/Q lines.
 
         Args:
             response: Raw response string from S! command
@@ -196,6 +201,9 @@ class RollingBufferProcessor:
             trigger_time = None
             i_samples = None
             q_samples = None
+            board_records: List[BoardSpeedMagnitudeRecord] = []
+            board_metadata: List[dict] = []
+            board_processing_enabled = False
 
             for line in response.strip().split("\n"):
                 line = line.strip()
@@ -204,6 +212,8 @@ class RollingBufferProcessor:
 
                 try:
                     data = json.loads(line)
+                    if not isinstance(data, dict):
+                        continue
 
                     if "sample_time" in data:
                         sample_time = float(data["sample_time"])
@@ -213,6 +223,51 @@ class RollingBufferProcessor:
                         i_samples = data["I"]
                     elif "Q" in data:
                         q_samples = data["Q"]
+                    elif {"time", "speed", "magnitude"}.issubset(data):
+                        try:
+                            speeds = data["speed"]
+                            magnitudes = data["magnitude"]
+                            if not isinstance(speeds, list):
+                                speeds = [speeds]
+                            if not isinstance(magnitudes, list):
+                                magnitudes = [magnitudes]
+                            speeds = [float(value) for value in speeds]
+                            magnitudes = [float(value) for value in magnitudes]
+                            if not all(math.isfinite(value) for value in speeds + magnitudes):
+                                raise ValueError("speed and magnitude must be finite")
+                            if len(speeds) != len(magnitudes):
+                                logger.warning(
+                                    "[PROCESSOR] Board speed/magnitude array length mismatch "
+                                    "at t=%s (%d speeds, %d magnitudes)",
+                                    data.get("time"),
+                                    len(speeds),
+                                    len(magnitudes),
+                                )
+                            board_records.append(
+                                BoardSpeedMagnitudeRecord(
+                                    timestamp=float(data["time"]),
+                                    unit=(str(data["unit"]) if data.get("unit") is not None else None),
+                                    magnitudes=magnitudes,
+                                    speeds=speeds,
+                                )
+                            )
+                        except (TypeError, ValueError) as error:
+                            # Board output is optional. Keep a valid I/Q capture
+                            # usable when one processed record is malformed.
+                            logger.warning(
+                                "[PROCESSOR] Ignoring malformed board speed/magnitude record: %s",
+                                error,
+                            )
+                    else:
+                        board_metadata.append(data)
+                        metadata_text = " ".join(
+                            f"{key}={value}" for key, value in data.items()
+                        ).lower()
+                        if (
+                            "continuous" in metadata_text
+                            and ("enabled" in metadata_text or "processing" in metadata_text)
+                        ):
+                            board_processing_enabled = True
 
                 except json.JSONDecodeError:
                     continue
@@ -234,12 +289,37 @@ class RollingBufferProcessor:
                     )
                     return None
 
+                capture_end_time = sample_time + len(i_samples) / self.SAMPLE_RATE
+                frame_tolerance = max(self.WINDOW_SIZE / self.SAMPLE_RATE, 0.01)
+                valid_board_records = []
+                for record in board_records:
+                    if sample_time - frame_tolerance <= record.timestamp <= capture_end_time + frame_tolerance:
+                        valid_board_records.append(record)
+                    else:
+                        logger.warning(
+                            "[PROCESSOR] Ignoring board record outside I/Q capture window: "
+                            "t=%.3f, window=%.3f..%.3f",
+                            record.timestamp,
+                            sample_time,
+                            capture_end_time,
+                        )
+                # Some SZ firmware emits only the time/speed/magnitude records
+                # and omits the explicit ContinuousSampling status line.
+                board_processing_enabled = board_processing_enabled or bool(valid_board_records)
+                board_timeline = BoardProcessedTimeline(
+                    records=valid_board_records,
+                    metadata=board_metadata,
+                    sample_time=sample_time,
+                    trigger_time=trigger_time,
+                    processing_enabled=board_processing_enabled,
+                )
                 return IQCapture(
                     sample_time=sample_time,
                     trigger_time=trigger_time,
                     i_samples=i_samples,
                     q_samples=q_samples,
                     first_byte_timestamp=first_byte_timestamp,
+                    board_timeline=board_timeline,
                 )
 
             # Log what's missing

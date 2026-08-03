@@ -12,10 +12,10 @@ Make sure you have all the hardware. See the **[Parts List](PARTS.md)** for what
 - MicroSD Card (32GB+)
 - 27W USB-C Power Supply (official Pi 5 PSU recommended)
 - OPS243-A Doppler Radar + USB cable
-- SparkFun SEN-14262 sound detector (wired per the [Sound Trigger Wiring Guide](sound-trigger-wiring.md))
 
-**Optional (deprecated):**
+**Optional:**
 - K-LD7 + FTDI adapter (×2) — for launch angle and club path (see [Parts List](PARTS.md)). **Deprecated** — superseded by a more capable radar chip; don't buy for a new build. Supported for existing builds only.
+- SparkFun SEN-14262 sound detector — legacy sound-trigger option
 
 ## Setup
 
@@ -51,7 +51,7 @@ it picks up where you left off.
 ### 3. Start hitting balls
 
 ```bash
-./scripts/start-kiosk.sh                # Default: rolling buffer + sound trigger
+./scripts/start-kiosk.sh                # Default: internal OPS243 trigger + rolling buffer
 ./scripts/start-kiosk.sh --kld7         # With K-LD7 angle radars (deprecated)
 ./scripts/start-kiosk.sh --mock         # Mock mode (no hardware)
 ```
@@ -78,8 +78,9 @@ things by hand.
 
 ### OPS243-A Rolling Buffer Mode
 
-The OPS243-A needs a one-time configuration to enable rolling buffer mode with
-hardware sound triggering, saved to flash so it boots correctly every time.
+Legacy hardware sound-trigger installations need a one-time configuration that
+saves rolling-buffer mode to flash. The default speed-trigger path does not use
+HOST_INT and does not require the SEN-14262.
 
 > **Why?** The OPS243-A has a firmware bug where the HOST_INT pin mode switches
 > unexpectedly when entering rolling buffer mode at runtime. Saving to flash and

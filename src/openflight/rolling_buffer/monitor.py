@@ -10,13 +10,14 @@ import statistics
 import threading
 import time
 from datetime import datetime
-from typing import Callable, List, Optional
+from pathlib import Path
+from typing import Any, Callable, List, Mapping, Optional
 
 from ..launch_monitor import ClubType, Shot, estimate_carry_distance
 from ..ops243 import OPS243Radar, SpeedReading
 from ..session_logger import get_session_logger, log_session_error
 from .processor import RollingBufferProcessor
-from .trigger import create_trigger
+from .trigger import RawCaptureResult, create_trigger
 from .types import ProcessedCapture
 
 logger = logging.getLogger("openflight.rolling_buffer.monitor")
@@ -235,9 +236,12 @@ class RollingBufferMonitor:
     def __init__(
         self,
         port: Optional[str] = None,
-        trigger_type: str = "speed",
+        trigger_type: str = "hardware",
         sample_rate_ksps: int = 30,
         ops_baud: Optional[int] = None,
+        sigmf_capture_dir: Optional[Path] = None,
+        capture_configuration: Optional[Mapping[str, Any]] = None,
+        board_processing_enabled: bool = False,
         **trigger_kwargs,
     ):
         """
@@ -251,7 +255,8 @@ class RollingBufferMonitor:
                 driver default (230400). Ignored over USB, where the rate
                 is nominal.
             trigger_type: Trigger strategy:
-                - "speed" (default, recommended): Fast speed trigger per manufacturer
+                - "hardware" (default, recommended): OPS243 internal speed trigger
+                - "speed": Host-polled speed trigger fallback
                 - "polling": Continuous capture polling (slower, simpler)
                 - "threshold": Speed threshold trigger
                 - "manual": External trigger for testing
@@ -263,6 +268,18 @@ class RollingBufferMonitor:
         self.trigger_type = trigger_type
         self.sample_rate_ksps = sample_rate_ksps
         self.trigger = create_trigger(trigger_type, **trigger_kwargs)
+        self._sigmf_capture_dir = (
+            Path(sigmf_capture_dir).expanduser() if sigmf_capture_dir is not None else None
+        )
+        self._sigmf_configuration = dict(capture_configuration or {})
+        self._board_processing_enabled = board_processing_enabled
+        # Speed-trigger mode enters rolling-buffer mode only after a speed
+        # event, so carry the startup choice on the trigger as well.
+        setattr(self.trigger, "board_processing_enabled", board_processing_enabled)
+        self._sigmf_session_dir: Optional[Path] = None
+        self._sigmf_capture_index = 0
+        self._sigmf_pending_meta_path: Optional[Path] = None
+        self._sigmf_pending_board_path: Optional[Path] = None
 
         self._running = False
         self._capture_thread: Optional[threading.Thread] = None
@@ -270,6 +287,100 @@ class RollingBufferMonitor:
         self._live_callback: Optional[Callable[[SpeedReading], None]] = None
         self._shots: List[Shot] = []
         self._current_club: ClubType = ClubType.DRIVER
+
+    def _start_sigmf_session(self) -> None:
+        """Create a fresh output session when the kiosk listener starts."""
+        self._sigmf_capture_index = 0
+        self._sigmf_session_dir = None
+        self._sigmf_pending_meta_path = None
+        self._sigmf_pending_board_path = None
+        if self._sigmf_capture_dir is None or self.trigger_type not in {"speed", "hardware"}:
+            return
+
+        try:
+            # Local import avoids a package-import cycle when standalone SigMF
+            # tooling imports the rolling-buffer trigger types.
+            from ..sigmf_capture import create_kiosk_session_directory
+
+            self._sigmf_session_dir = create_kiosk_session_directory(
+                self._sigmf_capture_dir,
+                time.time(),
+            )
+            logger.info("[SIGMF] Kiosk session started: %s", self._sigmf_session_dir)
+        except Exception as error:  # pylint: disable=broad-except
+            logger.error("[SIGMF] Failed to create kiosk session: %s", error, exc_info=True)
+            log_session_error(
+                "SigMF kiosk-session creation failed",
+                component="rolling_buffer_monitor",
+                context={
+                    "trigger_type": self.trigger_type,
+                    "output_dir": str(self._sigmf_capture_dir),
+                },
+                exc=error,
+            )
+
+    def _record_sigmf_capture(self, result: RawCaptureResult) -> None:
+        """Persist one complete triggered I/Q capture without affecting shots."""
+        if self._sigmf_capture_dir is None:
+            return
+
+        self._sigmf_capture_index += 1
+        try:
+            # Local import avoids a package-import cycle when standalone SigMF
+            # tooling imports the rolling-buffer trigger types.
+            from ..sigmf_capture import (
+                BOARD_OUTPUT_FILENAME,
+                DEFAULT_TEMPLATE_PATH,
+                write_kiosk_sigmf_hit,
+            )
+
+            if self._sigmf_session_dir is None:
+                raise RuntimeError("SigMF kiosk session directory is unavailable")
+
+            hit_dir, _, meta_path, _ = write_kiosk_sigmf_hit(
+                self._sigmf_session_dir,
+                DEFAULT_TEMPLATE_PATH,
+                self._sigmf_capture_index,
+                result,
+                configuration=self._sigmf_configuration,
+            )
+            self._sigmf_pending_meta_path = meta_path
+            self._sigmf_pending_board_path = hit_dir / BOARD_OUTPUT_FILENAME
+            logger.info("[SIGMF] Saved raw capture #%d: %s", self._sigmf_capture_index, hit_dir)
+        except Exception as error:  # pylint: disable=broad-except
+            self._sigmf_pending_meta_path = None
+            self._sigmf_pending_board_path = None
+            logger.error("[SIGMF] Failed to save raw capture: %s", error, exc_info=True)
+            log_session_error(
+                "SigMF raw-capture write failed",
+                component="rolling_buffer_monitor",
+                context={
+                    "trigger_type": self.trigger_type,
+                    "output_dir": str(self._sigmf_capture_dir),
+                    "capture_index": self._sigmf_capture_index,
+                },
+                exc=error,
+            )
+            diagnostic_callback = getattr(self, "_diagnostic_callback", None)
+            if diagnostic_callback is not None:
+                try:
+                    diagnostic_callback(
+                        {
+                            "timestamp": datetime.now().isoformat(),
+                            "accepted": False,
+                            "reason": "sigmf_write_failed",
+                            "trigger_type": self.trigger_type,
+                            "latency_ms": result.capture_latency_ms,
+                            "response_bytes": result.response_bytes,
+                            "total_readings": 0,
+                            "outbound_readings": 0,
+                            "inbound_readings": 0,
+                            "peak_outbound_mph": result.trigger_speed_mph or 0,
+                            "peak_inbound_mph": 0,
+                        }
+                    )
+                except Exception:  # pylint: disable=broad-except
+                    logger.exception("[SIGMF] Failed to emit write-failure diagnostic")
 
     def connect(self) -> bool:
         """
@@ -284,15 +395,31 @@ class RollingBufferMonitor:
         """
         self.radar.connect()
 
-        # Speed trigger handles its own configuration (starts in speed mode)
-        # Other triggers need rolling buffer mode configured upfront
-        if self.trigger_type != "speed":
+        if self.trigger_type == "hardware":
+            internal_trigger_kwargs = {
+                "trigger_threshold_mph": getattr(self.trigger, "trigger_threshold_mph", 25.0),
+                "pre_trigger_segments": getattr(self.trigger, "pre_trigger_segments", 16),
+                "sample_rate_ksps": self.sample_rate_ksps,
+            }
+            trigger_magnitude = getattr(self.trigger, "trigger_magnitude", 40)
+            if trigger_magnitude != 40:
+                internal_trigger_kwargs["trigger_magnitude"] = trigger_magnitude
+            if self._board_processing_enabled:
+                internal_trigger_kwargs["process_continuous_sampling"] = True
+            self.radar.configure_for_internal_speed_trigger(**internal_trigger_kwargs)
+            logger.info("[MONITOR] OPS internal hardware trigger configured")
+        # Speed trigger handles its own configuration (starts in speed mode).
+        # Other legacy triggers need rolling-buffer mode configured upfront.
+        elif self.trigger_type != "speed":
             # Get pre_trigger_segments from the trigger if available
             pre_trigger_segments = getattr(self.trigger, "pre_trigger_segments", 12)
-            self.radar.configure_for_rolling_buffer(
-                pre_trigger_segments=pre_trigger_segments,
-                sample_rate_ksps=self.sample_rate_ksps,
-            )
+            rolling_kwargs = {
+                "pre_trigger_segments": pre_trigger_segments,
+                "sample_rate_ksps": self.sample_rate_ksps,
+            }
+            if self._board_processing_enabled:
+                rolling_kwargs["process_continuous_sampling"] = True
+            self.radar.configure_for_rolling_buffer(**rolling_kwargs)
             logger.info(
                 "[MONITOR] Rolling buffer mode configured with S#%d, S=%d",
                 pre_trigger_segments,
@@ -352,6 +479,7 @@ class RollingBufferMonitor:
         self._shot_callback = shot_callback
         self._live_callback = live_callback
         self._diagnostic_callback = diagnostic_callback
+        self._start_sigmf_session()
         self._running = True
 
         self._capture_thread = threading.Thread(
@@ -412,11 +540,14 @@ class RollingBufferMonitor:
                 # Wait for trigger and capture
                 # Use a long timeout so sound/hardware triggers can wait
                 # for the next swing without noisy timeout-restart cycles.
-                capture = self.trigger.wait_for_trigger(
-                    radar=self.radar,
-                    processor=self.processor,
-                    timeout=30.0,
-                )
+                wait_kwargs = {
+                    "radar": self.radar,
+                    "processor": self.processor,
+                    "timeout": 30.0,
+                }
+                if self.trigger_type in {"speed", "hardware"} and self._sigmf_capture_dir is not None:
+                    wait_kwargs["raw_capture_callback"] = self._record_sigmf_capture
+                capture = self.trigger.wait_for_trigger(**wait_kwargs)
 
                 trigger_latency_ms = (time.time() - trigger_start) * 1000
 
@@ -569,6 +700,36 @@ class RollingBufferMonitor:
                             trigger_timestamp_source=capture.trigger_timestamp_source,
                             clock_sync_offset_s=capture.clock_sync_offset_s,
                             post_trigger_duration_ms=capture.post_trigger_duration_ms,
+                            board_output_file=(
+                                str(self._sigmf_pending_board_path)
+                                if self._sigmf_pending_board_path is not None
+                                else None
+                            ),
+                            board_record_count=(
+                                capture.board_timeline.record_count
+                                if capture.board_timeline is not None
+                                else None
+                            ),
+                            board_processing_enabled=(
+                                capture.board_timeline.processing_enabled
+                                if capture.board_timeline is not None
+                                else None
+                            ),
+                            board_unit=(
+                                capture.board_timeline.units
+                                if capture.board_timeline is not None
+                                else None
+                            ),
+                            board_peak_speed=(
+                                capture.board_timeline.peak_speed
+                                if capture.board_timeline is not None
+                                else None
+                            ),
+                            board_peak_magnitude=(
+                                capture.board_timeline.peak_magnitude
+                                if capture.board_timeline is not None
+                                else None
+                            ),
                             smash_factor=processed.smash_factor,
                             spin_rpm=processed.spin.spin_rpm if processed.spin else None,
                             spin_confidence=processed.spin.confidence if processed.spin else None,
@@ -698,6 +859,24 @@ class RollingBufferMonitor:
                             callback_ms,
                             total_ms,
                         )
+
+                    # The server callback may add camera/K-LD7 angles and
+                    # calculated spin. Enrich the already-written SigMF file
+                    # after that callback so it matches the UI shot payload.
+                    if self._sigmf_pending_meta_path is not None:
+                        try:
+                            from ..sigmf_capture import update_kiosk_sigmf_metadata
+
+                            update_kiosk_sigmf_metadata(
+                                self._sigmf_pending_meta_path,
+                                shot,
+                                len(self._shots),
+                            )
+                        except Exception as error:  # pylint: disable=broad-except
+                            logger.error("[SIGMF] Failed to enrich metadata: %s", error, exc_info=True)
+                        finally:
+                            self._sigmf_pending_meta_path = None
+                            self._sigmf_pending_board_path = None
                 else:
                     logger.info(
                         "[MONITOR] Shot validation failed: ball=%.1f mph (min 15 mph)",
@@ -738,6 +917,9 @@ class RollingBufferMonitor:
                 self.trigger.reset()
 
             except Exception as e:
+                if not self._running:
+                    logger.debug("[MONITOR] Capture loop exited during shutdown: %s", e)
+                    break
                 logger.error("[MONITOR] Capture loop error: %s", e, exc_info=True)
                 log_session_error(
                     "Rolling buffer capture loop error",

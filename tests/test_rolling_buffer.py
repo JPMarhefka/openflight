@@ -4,13 +4,18 @@ import json
 import math
 import time
 from datetime import datetime
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import numpy as np
 import pytest
 
 from openflight.launch_monitor import ClubType, Shot
+from openflight.ops243 import (
+    Direction as RadarDirection,
+    SpeedReading as RadarSpeedReading,
+)
 from openflight.rolling_buffer import (
+    HardwareTriggeredCapture,
     ImpactEstimate,
     IQCapture,
     ManualTrigger,
@@ -19,6 +24,7 @@ from openflight.rolling_buffer import (
     RollingBufferProcessor,
     SpeedReading,
     SpeedTimeline,
+    SpeedTriggeredCapture,
     SpinCandidate,
     SpinResult,
     ThresholdTrigger,
@@ -397,6 +403,87 @@ class TestRollingBufferProcessor:
         assert capture.sample_time == 0.136
         assert capture.trigger_time == 0.0
 
+    @pytest.mark.parametrize("firmware_metadata", [True, False])
+    def test_parse_combined_ops243_iq_and_board_output(self, processor, firmware_metadata):
+        """Rev F metadata and compact Rev D6 responses both retain board output."""
+        i_samples = [2048] * 4096
+        q_samples = [2048] * 4096
+        lines = [
+            '{"ContinuousSampling":"Process Continuous Sampling Raw Data enabled"}',
+            '{"sample_time":56.544}',
+            '{"trigger_time":56.646}',
+            f'{{"I":{json.dumps(i_samples)}}}',
+            f'{{"Q":{json.dumps(q_samples)}}}',
+        ]
+        if firmware_metadata:
+            lines.insert(0, '{"SamplingRate":10000,"SampleSize":1024,"FFTSize":1024}')
+            lines.append('{"WindowFunction":"Hanning"}')
+        lines.extend(
+            [
+                '{"time":56.550,"unit":"mps","magnitude":[21.03],"speed":[-0.07]}',
+                '{"time":56.5515,"unit":"mps","magnitude":[10.0,11.0],"speed":[0.5,0.6]}',
+            ]
+        )
+
+        capture = processor.parse_capture("\n".join(lines))
+
+        assert capture is not None
+        assert len(capture.i_samples) == 4096
+        assert len(capture.q_samples) == 4096
+        assert capture.board_timeline is not None
+        assert capture.board_timeline.record_count == 2
+        assert capture.board_timeline.units == "mps"
+        assert capture.board_timeline.processing_enabled is True
+        assert capture.board_timeline.records[1].speeds == [0.5, 0.6]
+        assert capture.board_timeline.records[1].magnitudes == [10.0, 11.0]
+        assert capture.board_timeline.records[0].to_dict(capture.sample_time)["time_offset_ms"] == pytest.approx(6.0)
+        if firmware_metadata:
+            assert any("SamplingRate" in metadata for metadata in capture.board_timeline.metadata)
+            assert any("WindowFunction" in metadata for metadata in capture.board_timeline.metadata)
+
+    def test_parse_capture_ignores_malformed_board_record(self, processor):
+        """Optional malformed board output cannot invalidate a valid I/Q capture."""
+        response = "\n".join(
+            [
+                '{"sample_time":1.0}',
+                '{"trigger_time":1.1}',
+                f'{{"I":{json.dumps([2048] * 4096)}}}',
+                f'{{"Q":{json.dumps([2048] * 4096)}}}',
+                '{"time":1.2,"unit":"mps","magnitude":"bad","speed":[1.0]}',
+                '{"time":1.12,"unit":"mps","magnitude":[2.0],"speed":[3.0]}',
+            ]
+        )
+
+        capture = processor.parse_capture(response)
+
+        assert capture is not None
+        assert capture.board_timeline is not None
+        assert capture.board_timeline.record_count == 1
+        assert capture.board_timeline.records[0].speeds == [3.0]
+
+    def test_parse_capture_discards_stale_board_speed_line(self, processor):
+        """A pre-capture speed line must not be logged as SZ frame output."""
+        response = "\n".join(
+            [
+                '{"sample_time":21.088}',
+                '{"trigger_time":21.105}',
+                f'{{"I":{json.dumps([2048] * 4096)}}}',
+                f'{{"Q":{json.dumps([2048] * 4096)}}}',
+                '{"trigger_velocity_detected":25}',
+                '{"time":14.821,"unit":"mph","magnitude":[198.0],"speed":[55.3]}',
+                '{"time":21.120,"unit":"mph","magnitude":198.0,"speed":55.3}',
+            ]
+        )
+
+        capture = processor.parse_capture(response)
+
+        assert capture is not None
+        assert capture.board_timeline is not None
+        assert capture.board_timeline.record_count == 1
+        assert capture.board_timeline.processing_enabled is True
+        assert capture.board_timeline.records[0].timestamp == pytest.approx(21.120)
+        assert capture.board_timeline.records[0].speeds == [55.3]
+
     def test_parse_capture_records_first_byte_timestamp(self, processor):
         """Parser should preserve first-byte time and infer trigger epoch."""
         i_samples = [2048] * 4096
@@ -530,6 +617,19 @@ class TestTriggerFactory:
         trigger = create_trigger("threshold", speed_threshold_mph=60)
         assert isinstance(trigger, ThresholdTrigger)
 
+    def test_create_speed_trigger(self):
+        """Factory should create the production 25 mph speed trigger."""
+        trigger = create_trigger("speed")
+        assert isinstance(trigger, SpeedTriggeredCapture)
+        assert trigger.min_trigger_speed_mph == 25
+
+    def test_default_is_internal_hardware_trigger(self):
+        """Production factory default should use the board-managed ST trigger."""
+        trigger = create_trigger()
+        assert isinstance(trigger, HardwareTriggeredCapture)
+        assert trigger.trigger_threshold_mph == 25
+        assert trigger.pre_trigger_segments == 16
+
     def test_create_manual_trigger(self):
         """Factory should create ManualTrigger."""
         trigger = create_trigger("manual")
@@ -539,6 +639,25 @@ class TestTriggerFactory:
         """Factory should raise error for unknown trigger type."""
         with pytest.raises(ValueError):
             create_trigger("invalid_type")
+
+    def test_monitor_configures_internal_trigger_on_connect(self):
+        """The production monitor delegates board setup to the new driver API."""
+        from openflight.rolling_buffer.monitor import RollingBufferMonitor
+
+        monitor = RollingBufferMonitor(
+            trigger_type="hardware",
+            trigger_threshold_mph=31,
+            pre_trigger_segments=20,
+        )
+        monitor.radar = MagicMock()
+
+        assert monitor.connect() is True
+
+        monitor.radar.configure_for_internal_speed_trigger.assert_called_once_with(
+            trigger_threshold_mph=31,
+            pre_trigger_segments=20,
+            sample_rate_ksps=30,
+        )
 
 
 class TestSoundTriggerTimestampPropagation:
@@ -614,6 +733,60 @@ class TestSoundTriggerTimestampPropagation:
             first_byte_timestamp=12345.678,
         )
         radar.rearm_rolling_buffer.assert_called_once_with(12)
+
+    def test_internal_hardware_trigger_parses_then_rearms_with_gc(self, monkeypatch):
+        """Board dumps are retained before the next GC arm command is issued."""
+        radar = MagicMock()
+        radar.wait_for_hardware_trigger.return_value = '{"sample_time": 0.0}'
+        radar.last_hardware_trigger_first_byte_timestamp = 12345.678
+        radar.last_clock_sync = None
+        radar.read_clock_sync.return_value = {
+            "best_offset_s": None,
+            "usable_for_trigger_timestamps": False,
+            "clock_sync_method": "no_valid_reads",
+            "reads": [],
+        }
+        capture = IQCapture(
+            sample_time=100.000,
+            trigger_time=100.068,
+            i_samples=[2048] * 4096,
+            q_samples=[2048] * 4096,
+        )
+        processor = MagicMock()
+        processor.parse_capture.return_value = capture
+        processor.process_standard.return_value = SpeedTimeline(
+            readings=[SpeedReading(100.0, 1000.0, 68.0, "outbound")],
+            sample_rate_hz=937.5,
+        )
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+        trigger = HardwareTriggeredCapture(trigger_threshold_mph=25, pre_trigger_segments=16)
+
+        result = trigger.wait_for_trigger(radar, processor, timeout=1.0)
+
+        assert result is capture
+        processor.parse_capture.assert_called_once_with(
+            '{"sample_time": 0.0}',
+            first_byte_timestamp=12345.678,
+        )
+        radar.rearm_internal_speed_trigger.assert_called_once_with(30)
+        # A received dump is not yet a successful shot.  The monitor emits
+        # the one accepted diagnostic after full processing/validation.
+        assert trigger.drain_diagnostics() == []
+
+    def test_internal_hardware_trigger_rearms_after_malformed_dump(self, monkeypatch):
+        """A bad received dump must not leave the board unable to capture again."""
+        radar = MagicMock()
+        radar.wait_for_hardware_trigger.return_value = "not-json"
+        radar.last_hardware_trigger_first_byte_timestamp = 12345.678
+        processor = MagicMock()
+        processor.parse_capture.return_value = None
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+        trigger = HardwareTriggeredCapture()
+
+        assert trigger.wait_for_trigger(radar, processor, timeout=1.0) is None
+
+        radar.rearm_internal_speed_trigger.assert_called_once_with(30)
+        assert trigger.drain_diagnostics()[0]["reason"] == "parse_failed"
 
     def test_sound_trigger_prefers_ops_clock_sync_for_trigger_timestamp(self):
         """Radar-clock trigger time should beat first-byte timing when available."""
@@ -839,6 +1012,340 @@ class TestThresholdTrigger:
         trigger._triggered = True
         trigger.reset()
         assert trigger._triggered is False
+
+
+class TestSpeedTriggeredCapture:
+    """Tests for the production club-speed trigger state machine."""
+
+    @staticmethod
+    def _capture():
+        return IQCapture(
+            sample_time=1.0,
+            trigger_time=1.0,
+            i_samples=[0] * 4096,
+            q_samples=[0] * 4096,
+        )
+
+    def test_strict_threshold_capture_and_immediate_restore(self, monkeypatch):
+        """Exactly 25 mph is ignored; >25 captures and restores speed mode."""
+        trigger = SpeedTriggeredCapture(min_trigger_speed_mph=25)
+        capture = self._capture()
+        radar = MagicMock()
+        radar.serial = MagicMock()
+        radar.read_speed_nonblocking.side_effect = [
+            RadarSpeedReading(speed=25.0, direction=RadarDirection.OUTBOUND),
+            RadarSpeedReading(speed=25.1, direction=RadarDirection.OUTBOUND),
+        ]
+        radar.trigger_capture.return_value = "raw"
+        processor = MagicMock()
+        processor.parse_capture.return_value = capture
+        processor.process_standard.return_value = SpeedTimeline(
+            readings=[SpeedReading(100.0, 10.0, 20.0, "outbound")],
+            sample_rate_hz=937.5,
+            capture=capture,
+        )
+        sleeps = []
+        monkeypatch.setattr(time, "sleep", sleeps.append)
+
+        result = trigger.wait_for_trigger(radar, processor, timeout=1)
+
+        assert result is capture
+        assert trigger.last_trigger_speed == pytest.approx(25.1)
+        assert radar.configure_for_speed_trigger.call_args_list == [
+            call(25),
+            call(25),
+        ]
+        radar.switch_to_rolling_buffer.assert_called_once_with()
+        radar.trigger_capture.assert_called_once_with(timeout=30.0)
+        assert 0.015 in sleeps
+        trigger.reset()
+        assert trigger._speed_mode_active is True
+
+    def test_raw_capture_returns_complete_iq_without_ball_validation(self, monkeypatch):
+        """The collector path keeps a parsed capture even when it is not a shot."""
+        trigger = SpeedTriggeredCapture(min_trigger_speed_mph=25)
+        capture = self._capture()
+        radar = MagicMock()
+        radar.serial = MagicMock()
+        radar.read_speed_nonblocking.return_value = RadarSpeedReading(
+            speed=30.0, direction=RadarDirection.OUTBOUND
+        )
+        radar.trigger_capture.return_value = "raw"
+        processor = MagicMock()
+        processor.parse_capture.return_value = capture
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+        result = trigger.wait_for_raw_capture(radar, processor, timeout=1)
+
+        assert result is not None
+        assert result.capture is capture
+        assert result.trigger_speed_mph == 30.0
+        assert result.trigger_threshold_mph == 25
+        processor.process_standard.assert_not_called()
+        assert radar.configure_for_speed_trigger.call_count == 2
+
+    def test_raw_callback_runs_before_ball_gate_for_rejected_capture(self, monkeypatch):
+        """Kiosk SigMF recording must retain complete non-ball captures."""
+        trigger = SpeedTriggeredCapture(min_trigger_speed_mph=25)
+        capture = self._capture()
+        radar = MagicMock()
+        radar.serial = MagicMock()
+        config_calls = 0
+        events = []
+
+        def configure_speed_mode(_threshold):
+            nonlocal config_calls
+            config_calls += 1
+            events.append("initial_speed_mode" if config_calls == 1 else "restored_speed_mode")
+
+        radar.configure_for_speed_trigger.side_effect = configure_speed_mode
+        radar.read_speed_nonblocking.return_value = RadarSpeedReading(
+            speed=30.0, direction=RadarDirection.OUTBOUND
+        )
+        radar.trigger_capture.return_value = "raw"
+        processor = MagicMock()
+        processor.parse_capture.side_effect = lambda _response: events.append("parsed") or capture
+        processor.process_standard.return_value = SpeedTimeline(
+            readings=[SpeedReading(20.0, 10.0, 0.0, "outbound")],
+            sample_rate_hz=937.5,
+            capture=capture,
+        )
+        callback = MagicMock(side_effect=lambda result: events.append("callback"))
+        processor.process_standard.side_effect = lambda value: (
+            events.append("ball_gate") or SpeedTimeline(
+                readings=[SpeedReading(20.0, 10.0, 0.0, "outbound")],
+                sample_rate_hz=937.5,
+                capture=capture,
+            )
+        )
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+        assert trigger.wait_for_trigger(
+            radar, processor, timeout=1, raw_capture_callback=callback
+        ) is None
+
+        callback.assert_called_once()
+        assert callback.call_args.args[0].capture is capture
+        assert events == [
+            "initial_speed_mode",
+            "parsed",
+            "callback",
+            "restored_speed_mode",
+            "ball_gate",
+        ]
+
+    def test_raw_callback_skips_malformed_response(self, monkeypatch):
+        """No recorder callback fires when the UART response cannot be parsed."""
+        trigger = SpeedTriggeredCapture(min_trigger_speed_mph=25)
+        radar = MagicMock()
+        radar.serial = MagicMock()
+        radar.read_speed_nonblocking.return_value = RadarSpeedReading(
+            speed=30.0, direction=RadarDirection.OUTBOUND
+        )
+        radar.trigger_capture.return_value = "bad"
+        processor = MagicMock()
+        processor.parse_capture.return_value = None
+        callback = MagicMock()
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+        assert trigger.wait_for_trigger(
+            radar, processor, timeout=1, raw_capture_callback=callback
+        ) is None
+        callback.assert_not_called()
+        assert trigger.drain_diagnostics()[0]["reason"] == "parse_failed"
+
+    def test_parse_failure_restores_speed_mode(self, monkeypatch):
+        """A malformed capture is emitted to Diagnostics and restores speed mode."""
+        trigger = SpeedTriggeredCapture(min_trigger_speed_mph=25)
+        radar = MagicMock()
+        radar.serial = MagicMock()
+        radar.read_speed_nonblocking.side_effect = [
+            RadarSpeedReading(speed=30.0, direction=RadarDirection.OUTBOUND),
+            None,
+            None,
+        ]
+        radar.trigger_capture.return_value = "bad"
+        processor = MagicMock()
+        processor.parse_capture.return_value = None
+        now = [-0.1]
+
+        def fake_time():
+            now[0] += 0.1
+            return now[0]
+
+        monkeypatch.setattr(time, "time", fake_time)
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+        assert trigger.wait_for_trigger(radar, processor, timeout=0.5) is None
+        assert radar.configure_for_speed_trigger.call_count == 2
+        diagnostics = trigger.drain_diagnostics()
+        assert len(diagnostics) == 1
+        assert diagnostics[0]["reason"] == "parse_failed"
+        assert diagnostics[0]["response_bytes"] == 3
+        assert diagnostics[0]["all_outbound_speeds"] == [30.0]
+
+    def test_no_response_is_reported_to_diagnostics(self, monkeypatch):
+        """An empty S! response must be visible without creating a shot."""
+        trigger = SpeedTriggeredCapture(min_trigger_speed_mph=25)
+        radar = MagicMock()
+        radar.serial = MagicMock()
+        radar.read_speed_nonblocking.return_value = RadarSpeedReading(
+            speed=65.0, direction=RadarDirection.OUTBOUND
+        )
+        radar.trigger_capture.return_value = ""
+        processor = MagicMock()
+        processor.parse_capture.return_value = None
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+        assert trigger.wait_for_trigger(radar, processor, timeout=1) is None
+
+        diagnostics = trigger.drain_diagnostics()
+        assert len(diagnostics) == 1
+        assert diagnostics[0]["accepted"] is False
+        assert diagnostics[0]["reason"] == "no_response"
+        assert diagnostics[0]["response_bytes"] == 0
+        assert diagnostics[0]["all_outbound_speeds"] == [65.0]
+
+    def test_uart_read_failure_remains_categorized_when_restore_fails(self, monkeypatch):
+        """A bad USB port must not hide the UART outcome behind setup failure."""
+        trigger = SpeedTriggeredCapture(min_trigger_speed_mph=25)
+        radar = MagicMock()
+        radar.serial = MagicMock()
+        radar.read_speed_nonblocking.return_value = RadarSpeedReading(
+            speed=65.0, direction=RadarDirection.OUTBOUND
+        )
+        radar.trigger_capture.return_value = ""
+        radar.last_capture_receive_error = "device reports readiness to read but returned no data"
+        config_calls = 0
+
+        def configure_speed_mode(_threshold):
+            nonlocal config_calls
+            config_calls += 1
+            if config_calls == 2:
+                raise OSError("device unavailable")
+
+        radar.configure_for_speed_trigger.side_effect = configure_speed_mode
+        processor = MagicMock()
+        processor.parse_capture.return_value = None
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+        result = trigger.wait_for_raw_capture(radar, processor, timeout=1)
+
+        assert result is not None
+        assert result.failure_reason == "uart_read_failed"
+        assert config_calls == 2
+        assert trigger._speed_mode_active is False
+
+    def test_raw_callback_failure_does_not_block_confirmed_ball(self, monkeypatch):
+        """Recorder faults are isolated from the normal kiosk shot path."""
+        trigger = SpeedTriggeredCapture(min_trigger_speed_mph=25)
+        capture = self._capture()
+        radar = MagicMock()
+        radar.serial = MagicMock()
+        radar.read_speed_nonblocking.return_value = RadarSpeedReading(
+            speed=65.0, direction=RadarDirection.OUTBOUND
+        )
+        radar.trigger_capture.return_value = "raw"
+        processor = MagicMock()
+        processor.parse_capture.return_value = capture
+        processor.process_standard.return_value = SpeedTimeline(
+            readings=[SpeedReading(100.0, 10.0, 0.0, "outbound")],
+            sample_rate_hz=937.5,
+            capture=capture,
+        )
+        callback = MagicMock(side_effect=OSError("disk full"))
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+        assert trigger.wait_for_trigger(
+            radar,
+            processor,
+            timeout=1,
+            raw_capture_callback=callback,
+        ) is capture
+        callback.assert_called_once()
+        processor.process_standard.assert_called_once_with(capture)
+
+    def test_complete_club_only_capture_is_reported_to_diagnostics(self, monkeypatch):
+        """A tuning-fork trigger is visible without becoming a shot."""
+        trigger = SpeedTriggeredCapture(min_trigger_speed_mph=25)
+        capture = self._capture()
+        radar = MagicMock()
+        radar.serial = MagicMock()
+        radar.read_speed_nonblocking.return_value = RadarSpeedReading(
+            speed=65.0, direction=RadarDirection.OUTBOUND
+        )
+        radar.trigger_capture.return_value = "raw-capture"
+        processor = MagicMock()
+        processor.parse_capture.return_value = capture
+        processor.process_standard.return_value = SpeedTimeline(
+            readings=[
+                SpeedReading(20.0, 10.0, 0.0, "outbound"),
+                SpeedReading(12.0, 5.0, 4.0, "inbound"),
+            ],
+            sample_rate_hz=937.5,
+            capture=capture,
+        )
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+        assert trigger.wait_for_trigger(radar, processor, timeout=1) is None
+
+        diagnostics = trigger.drain_diagnostics()
+        assert len(diagnostics) == 1
+        diag = diagnostics[0]
+        assert diag["accepted"] is False
+        assert diag["reason"] == "no_ball_speed"
+        assert diag["response_bytes"] == len("raw-capture")
+        assert diag["all_outbound_speeds"] == [65.0, 20.0]
+        assert diag["peak_outbound_mph"] == 65.0
+        assert diag["outbound_readings"] == 2
+        assert diag["inbound_readings"] == 1
+        assert radar.configure_for_speed_trigger.call_count == 2
+
+    def test_monitor_forwards_rejected_speed_diagnostic(self, monkeypatch):
+        """Speed diagnostics use the existing monitor/UI callback path."""
+        import openflight.rolling_buffer.monitor as monitor_module
+        from openflight.rolling_buffer import RollingBufferMonitor
+
+        monitor = RollingBufferMonitor(port=None, trigger_type="speed")
+        monitor.trigger._append_diagnostic(
+            accepted=False,
+            reason="no_ball_speed",
+            response_bytes=41034,
+            total_readings=1,
+            outbound_readings=1,
+            peak_outbound_mph=65.0,
+            all_outbound_speeds=[65.0],
+            trigger_latency_ms=25000.0,
+        )
+        callback = MagicMock()
+        monitor._diagnostic_callback = callback
+        monkeypatch.setattr(monitor_module, "get_session_logger", lambda: None)
+
+        monitor._emit_diagnostics()
+
+        callback.assert_called_once()
+        diagnostic = callback.call_args.args[0]
+        assert diagnostic["trigger_type"] == "speed"
+        assert diagnostic["accepted"] is False
+        assert diagnostic["reason"] == "no_ball_speed"
+        assert diagnostic["peak_outbound_mph"] == 65.0
+        assert diagnostic["response_bytes"] == 41034
+
+    def test_capture_exception_restores_speed_mode(self, monkeypatch):
+        """Capture errors must restore speed mode before propagating."""
+        trigger = SpeedTriggeredCapture(min_trigger_speed_mph=25)
+        radar = MagicMock()
+        radar.serial = MagicMock()
+        radar.read_speed_nonblocking.return_value = RadarSpeedReading(
+            speed=30.0, direction=RadarDirection.OUTBOUND
+        )
+        radar.trigger_capture.side_effect = RuntimeError("serial failure")
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+        with pytest.raises(RuntimeError, match="serial failure"):
+            trigger.wait_for_trigger(radar, MagicMock(), timeout=1)
+
+        assert radar.configure_for_speed_trigger.call_count == 2
 
 
 class TestManualTrigger:

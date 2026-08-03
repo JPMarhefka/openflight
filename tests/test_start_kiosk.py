@@ -1,5 +1,6 @@
 """Tests for the kiosk entry script flag wiring."""
 
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -138,9 +139,84 @@ def test_trackman_test_dry_run_enables_raw_capture():
     assert "--kld7-horizontal" in command
     assert "--kld7-horizontal-port /dev/kld7_horizontal" in command
     assert "--no-camera" in command
-    assert "--trigger sound" in command
+    assert "--trigger hardware" in command
+    assert "--trigger-threshold 25" in command
+    assert "--pre-trigger-segments 4" in command
     # No legacy estimator selection survives.
     assert "--kld7-vertical-estimator" not in command
+
+
+def test_hardware_trigger_is_default_and_sound_remains_available():
+    """Production defaults to the OPS internal trigger with a sound fallback."""
+    default_command = _dry_run().stdout.strip()
+    sound_command = _dry_run("--trigger", "sound").stdout.strip()
+
+    assert "--trigger hardware" in default_command
+    assert "--trigger-threshold 25" in default_command
+    assert "--pre-trigger-segments 4" in default_command
+    assert "--trigger sound" in sound_command
+    assert "--trigger-threshold" not in sound_command
+
+
+def test_board_processing_is_enabled_by_default_and_can_be_disabled():
+    """Kiosk startup requests SZ while retaining an explicit opt-out."""
+    assert "--board-processing" in _dry_run().stdout
+    assert "--board-processing" not in _dry_run("--no-board-processing").stdout
+
+
+def test_hardware_trigger_flags_and_legacy_aliases_are_forwarded():
+    """Kiosk flags keep the new generic names while accepting legacy scripts."""
+    generic = _dry_run("--trigger-threshold", "31", "--pre-trigger-segments", "20").stdout
+    legacy = _dry_run("--speed-trigger-threshold", "31", "--sound-pre-trigger", "20").stdout
+
+    for command in (generic, legacy):
+        assert "--trigger-threshold 31" in command
+        assert "--pre-trigger-segments 20" in command
+
+
+def test_sigmf_capture_dir_is_forwarded_to_server():
+    """Kiosk defaults raw capture and allows an explicit directory override."""
+    output_dir = "/tmp/openflight-sigmf"
+    command = _dry_run("--sigmf-capture-dir", output_dir).stdout.strip()
+    default_command = _dry_run().stdout.strip()
+
+    assert f"--sigmf-capture-dir {output_dir}" in command
+    assert f"--sigmf-capture-dir {Path.home() / 'openflight_sessions' / 'range-sigmf'}" in default_command
+
+
+def test_hotspot_flag_is_opt_in_and_described_in_dry_run():
+    """Hotspot setup is represented without touching networking during dry-run."""
+    result = _dry_run("--hotspot")
+    assert "hotspot: enabled" in result.stdout
+    assert "SSID=Launch_Dev" in result.stdout
+    assert "interface=wlan0" in result.stdout
+    assert "address=10.42.0.1/24" in result.stdout
+    assert "--hotspot" not in _dry_run().stdout
+
+
+def test_hotspot_configuration_is_opt_in_and_persistent():
+    """The launcher configures NetworkManager only when explicitly requested."""
+    script = (Path(__file__).resolve().parents[1] / "scripts" / "start-kiosk.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'HOTSPOT_CONNECTION="OpenFlight-Launch-Dev"' in script
+    assert 'HOTSPOT_SSID="Launch_Dev"' in script
+    assert "HOTSPOT_PASSWORD='Jetson1$'" in script
+    assert 'HOTSPOT_ADDRESS="10.42.0.1/24"' in script
+    assert 'nmcli connection up "$HOTSPOT_CONNECTION"' in script
+    assert "nmcli connection down" not in script
+
+
+def test_sigmf_capture_dir_with_spaces_is_preserved_as_one_server_argument():
+    """The kiosk launcher must not split an exact user-supplied output path."""
+    output_dir = "/tmp/openflight sigmf capture"
+    command = _dry_run("--sigmf-capture-dir", output_dir).stdout.strip()
+
+    assert shlex.split(command)[-1] == output_dir
+    script = (Path(__file__).resolve().parents[1] / "scripts" / "start-kiosk.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'uv run $SERVER_CMD --sigmf-capture-dir "$SIGMF_CAPTURE_DIR" &' in script
 
 
 def test_trackman_test_allows_explicit_session_location():

@@ -7,11 +7,12 @@ Defines different methods for determining when to capture the rolling buffer.
 import logging
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 from .processor import RollingBufferProcessor
-from .types import IQCapture
+from .types import BoardProcessedTimeline, IQCapture, SpeedTimeline
 
 if TYPE_CHECKING:
     from ..ops243 import OPS243Radar
@@ -19,6 +20,30 @@ if TYPE_CHECKING:
 # Incremented per capture for log sequencing (not shot number)
 
 logger = logging.getLogger("openflight.rolling_buffer.trigger")
+
+
+@dataclass
+class RawCaptureResult:
+    """Outcome of one triggered rolling-buffer acquisition.
+
+    ``capture`` is ``None`` when the OPS243 triggered but did not return a
+    complete, parseable I/Q response.  This keeps raw acquisition separate
+    from the production monitor's later ball-speed acceptance decision.
+    """
+
+    capture: Optional[IQCapture]
+    trigger_speed_mph: Optional[float]
+    trigger_timestamp: float
+    response_bytes: int
+    capture_latency_ms: float
+    trigger_threshold_mph: Optional[float]
+    failure_reason: Optional[str] = None
+    board_timeline: Optional[BoardProcessedTimeline] = None
+
+
+# Retained for callers that use the original speed-trigger public type.
+SpeedTriggeredCaptureResult = RawCaptureResult
+RawCaptureCallback = Callable[[RawCaptureResult], None]
 
 
 class TriggerStrategy(ABC):
@@ -399,7 +424,7 @@ class SpeedTriggeredCapture(TriggerStrategy):
 
     This implements the manufacturer's recommended approach for golf:
     1. Run in fast speed detection mode (~150-200Hz report rate)
-    2. When outbound speed >20mph detected, immediately switch to rolling buffer
+    2. When outbound speed >25mph detected, immediately switch to rolling buffer
     3. Capture ball impact and flight with S#0 (no pre-trigger history)
 
     Advantages over polling:
@@ -414,9 +439,15 @@ class SpeedTriggeredCapture(TriggerStrategy):
     ball impact is around 20-40ms, that should be ok."
     """
 
+    # The 4,096-sample I/Q response is acquired in ~136.5 ms at 30 ksps,
+    # but its JSON representation can take substantially longer to traverse
+    # the 57,600-baud UART.  Do not confuse acquisition time with download
+    # time: the old 5 s window truncated real board captures before Q arrived.
+    CAPTURE_RECEIVE_TIMEOUT_SEC = 30.0
+
     def __init__(
         self,
-        min_trigger_speed_mph: float = 20.0,
+        min_trigger_speed_mph: float = 25.0,
         min_ball_speed_mph: float = 35.0,
         trigger_to_capture_delay_ms: float = 15.0,
         pre_trigger_segments: int = 0,  # Speed trigger defaults to 0 (no pre-trigger)
@@ -425,7 +456,8 @@ class SpeedTriggeredCapture(TriggerStrategy):
         Initialize speed-triggered capture.
 
         Args:
-            min_trigger_speed_mph: Minimum speed to trigger capture (default 20mph)
+            min_trigger_speed_mph: Speed must be strictly greater than this value
+                to trigger capture (default 25mph)
             min_ball_speed_mph: Minimum ball speed to consider valid shot (default 35mph)
             trigger_to_capture_delay_ms: Delay after trigger before capture (default 15ms)
                 This allows ball impact to happen before we dump the buffer.
@@ -436,46 +468,97 @@ class SpeedTriggeredCapture(TriggerStrategy):
         self.min_ball_speed_mph = min_ball_speed_mph
         self.trigger_to_capture_delay_ms = trigger_to_capture_delay_ms
         self._last_trigger_speed: float = 0
-        self._needs_reconfigure = True
+        self._speed_mode_active = False
 
-    def wait_for_trigger(
+    def _configure_speed_mode(self, radar: "OPS243Radar", settle: bool = False) -> None:
+        """Put the radar in normal speed-reporting mode for the next swing."""
+        self._speed_mode_active = False
+        radar.configure_for_speed_trigger(self.min_trigger_speed_mph)
+        if radar.serial:
+            radar.serial.reset_input_buffer()
+        if settle:
+            time.sleep(0.1)
+        self._speed_mode_active = True
+
+    def _restore_speed_mode(self, radar: "OPS243Radar") -> None:
+        """Attempt restoration without hiding a completed capture outcome."""
+        try:
+            self._configure_speed_mode(radar)
+        except Exception:  # pylint: disable=broad-except
+            # If the USB device is temporarily unhealthy, preserve the parsed
+            # capture/UART failure result and let the next loop retry setup.
+            self._speed_mode_active = False
+            logger.exception("[TRIGGER] Failed to restore speed trigger mode; will retry")
+
+    def _append_capture_diagnostic(
+        self,
+        *,
+        reason: str,
+        response_bytes: int,
+        trigger_latency_ms: float,
+        timeline: Optional[SpeedTimeline] = None,
+    ) -> None:
+        """Record a rejected speed-trigger capture for the existing debug UI.
+
+        The speed-mode reading that started the capture is not part of the
+        rolling-buffer FFT timeline. Include it in the existing outbound-speed
+        diagnostic fields so a club-only test still appears in Diagnostics,
+        without being promoted to a shot.
+        """
+        readings = timeline.readings if timeline else []
+        captured_outbound = [reading for reading in readings if reading.is_outbound]
+        captured_inbound = [reading for reading in readings if not reading.is_outbound]
+        outbound_speeds = [self._last_trigger_speed] + [
+            reading.speed_mph for reading in captured_outbound
+        ]
+        inbound_speeds = [reading.speed_mph for reading in captured_inbound]
+
+        self._append_diagnostic(
+            accepted=False,
+            reason=reason,
+            response_bytes=response_bytes,
+            total_readings=1 + len(readings),
+            outbound_readings=1 + len(captured_outbound),
+            inbound_readings=len(captured_inbound),
+            peak_outbound_mph=max(outbound_speeds, default=0),
+            peak_inbound_mph=max(inbound_speeds, default=0),
+            all_outbound_speeds=outbound_speeds,
+            all_inbound_speeds=inbound_speeds,
+            peak_outbound_magnitude=max(
+                (reading.magnitude for reading in captured_outbound), default=0
+            ),
+            peak_inbound_magnitude=max(
+                (reading.magnitude for reading in captured_inbound), default=0
+            ),
+            trigger_latency_ms=trigger_latency_ms,
+        )
+
+    def wait_for_raw_capture(
         self,
         radar: "OPS243Radar",
         processor: RollingBufferProcessor,
         timeout: float = 30.0,
-    ) -> Optional[IQCapture]:
+        raw_capture_callback: Optional[RawCaptureCallback] = None,
+    ) -> Optional[SpeedTriggeredCaptureResult]:
         """
-        Wait for speed trigger, switch to rolling buffer, and capture.
+        Wait for a speed trigger and return its raw I/Q acquisition outcome.
 
-        Flow:
-        1. Configure radar for fast speed detection (if needed)
-        2. Poll for speed readings at ~150-200Hz
-        3. When speed >= threshold detected:
-           a. Record club speed
-           b. Switch to rolling buffer mode (GC + S#0)
-           c. Wait for ball impact (~15-25ms)
-           d. Trigger capture (S!)
-        4. Return to speed detection mode for next shot
+        Unlike :meth:`wait_for_trigger`, this method does not reject a valid
+        I/Q buffer because it lacks a ball-speed peak.  Offline collection
+        tools need those captures too.
         """
         # Configure for speed trigger mode if needed
-        if self._needs_reconfigure:
-            radar.configure_for_speed_trigger()
-            self._needs_reconfigure = False
-            # Clear any buffered data from mode switch
-            if radar.serial:
-                radar.serial.reset_input_buffer()
-            time.sleep(0.1)
+        if not self._speed_mode_active:
+            self._configure_speed_mode(radar, settle=True)
 
         start_time = time.time()
-        logger.info(
-            "[TRIGGER] Waiting for speed trigger >= %.1f mph...", self.min_trigger_speed_mph
-        )
+        logger.info("[TRIGGER] Waiting for speed trigger > %.1f mph...", self.min_trigger_speed_mph)
 
         while (time.time() - start_time) < timeout:
             # Non-blocking speed read
             reading = radar.read_speed_nonblocking()
 
-            if reading and reading.speed >= self.min_trigger_speed_mph:
+            if reading and reading.speed > self.min_trigger_speed_mph:
                 # Speed detected - this is likely the club
                 self._last_trigger_speed = reading.speed
                 trigger_time = time.time()
@@ -486,49 +569,71 @@ class SpeedTriggeredCapture(TriggerStrategy):
                     reading.direction.value,
                 )
 
-                # Immediately switch to rolling buffer mode
-                radar.switch_to_rolling_buffer()
-
-                # Wait for ball impact
-                # Club to ball is typically 20-40ms, we wait a portion of that
-                delay_sec = self.trigger_to_capture_delay_ms / 1000.0
-                time.sleep(delay_sec)
-
-                # Capture the rolling buffer
-                response = radar.trigger_capture(timeout=5.0)
-                capture = processor.parse_capture(response)
-
-                # Calculate timing
-                capture_time = time.time()
-                total_delay_ms = (capture_time - trigger_time) * 1000
-                logger.info("[TRIGGER] Buffer captured %.1fms after trigger", total_delay_ms)
-
-                if capture:
-                    # Validate capture has ball speed
-                    timeline = processor.process_standard(capture)
-                    outbound = [
-                        r
-                        for r in timeline.readings
-                        if r.is_outbound and r.speed_mph >= self.min_ball_speed_mph
-                    ]
-
-                    if outbound:
-                        peak = max(r.speed_mph for r in outbound)
-                        logger.info("[TRIGGER] Ball detected: %.1f mph in capture", peak)
-
-                        # Mark for reconfigure on next call
-                        self._needs_reconfigure = True
-                        return capture
+                response = ""
+                result: Optional[SpeedTriggeredCaptureResult] = None
+                self._speed_mode_active = False
+                try:
+                    # Immediately switch to rolling buffer mode. S#0 causes the
+                    # OPS243 to collect a full 4096-sample post-trigger buffer.
+                    if getattr(self, "board_processing_enabled", False):
+                        radar.switch_to_rolling_buffer(process_continuous_sampling=True)
                     else:
-                        logger.info(
-                            "[TRIGGER] No speed >= %.1f mph in capture", self.min_ball_speed_mph
-                        )
+                        radar.switch_to_rolling_buffer()
 
-                # Reconfigure for speed mode and continue
-                self._needs_reconfigure = True
-                radar.configure_for_speed_trigger()
-                if radar.serial:
-                    radar.serial.reset_input_buffer()
+                    # Preserve the established club-to-S! timing. At 30ksps,
+                    # the capture then stops automatically after ~136.5ms.
+                    delay_sec = self.trigger_to_capture_delay_ms / 1000.0
+                    time.sleep(delay_sec)
+                    response = radar.trigger_capture(timeout=self.CAPTURE_RECEIVE_TIMEOUT_SEC)
+                    capture = processor.parse_capture(response)
+
+                    # Capture timing ends when the full UART response has been
+                    # parsed.  Save the complete raw buffer before restoring
+                    # speed mode or applying the production ball-speed gate.
+                    capture_latency_ms = (time.time() - trigger_time) * 1000
+                    if capture:
+                        result = SpeedTriggeredCaptureResult(
+                            capture=capture,
+                            trigger_speed_mph=reading.speed,
+                            trigger_timestamp=trigger_time,
+                            response_bytes=len(response),
+                            capture_latency_ms=capture_latency_ms,
+                            trigger_threshold_mph=self.min_trigger_speed_mph,
+                            board_timeline=capture.board_timeline,
+                        )
+                        if raw_capture_callback is not None:
+                            try:
+                                raw_capture_callback(result)
+                            except Exception:  # pylint: disable=broad-except
+                                # Raw-data persistence is diagnostic only; it
+                                # must never prevent the normal kiosk shot path.
+                                logger.exception("[TRIGGER] Raw-capture callback failed")
+                    else:
+                        receive_error = getattr(radar, "last_capture_receive_error", None)
+                        if isinstance(receive_error, str) and receive_error:
+                            reason = "uart_read_failed"
+                        else:
+                            reason = "no_response" if not response else "parse_failed"
+                        result = SpeedTriggeredCaptureResult(
+                            capture=None,
+                            trigger_speed_mph=reading.speed,
+                            trigger_timestamp=trigger_time,
+                            response_bytes=len(response),
+                            capture_latency_ms=capture_latency_ms,
+                            trigger_threshold_mph=self.min_trigger_speed_mph,
+                            failure_reason=reason,
+                        )
+                finally:
+                    # The raw response is local by this point, so restore normal
+                    # speed reporting before FFT processing.
+                    self._restore_speed_mode(radar)
+
+                # An exception from the radar or parser propagates after the
+                # finally block restores speed mode. Otherwise the result is
+                # always set by the complete/failed parse branches above.
+                assert result is not None
+                logger.info("[TRIGGER] Buffer captured %.1fms after trigger", result.capture_latency_ms)
+                return result
 
             # Brief sleep to avoid busy-waiting but stay responsive
             time.sleep(0.002)  # 2ms = 500Hz poll rate
@@ -536,10 +641,64 @@ class SpeedTriggeredCapture(TriggerStrategy):
         logger.info("[TRIGGER] Speed trigger timeout")
         return None
 
+    def wait_for_trigger(
+        self,
+        radar: "OPS243Radar",
+        processor: RollingBufferProcessor,
+        timeout: float = 30.0,
+        raw_capture_callback: Optional[RawCaptureCallback] = None,
+    ) -> Optional[IQCapture]:
+        """Return a confirmed ball capture for the production monitor.
+
+        The raw acquisition mechanics are shared with the SigMF collector,
+        while the monitor retains its existing minimum-ball-speed gate and
+        diagnostic entries.
+        """
+        result = self.wait_for_raw_capture(
+            radar,
+            processor,
+            timeout,
+            raw_capture_callback=raw_capture_callback,
+        )
+        if result is None:
+            return None
+
+        if result.capture is None:
+            logger.info("[TRIGGER] Speed capture rejected: %s", result.failure_reason)
+            self._append_capture_diagnostic(
+                reason=result.failure_reason or "parse_failed",
+                response_bytes=result.response_bytes,
+                trigger_latency_ms=result.capture_latency_ms,
+            )
+            return None
+
+        capture = result.capture
+
+        # Validate capture has ball speed.
+        timeline = processor.process_standard(capture)
+        outbound = [
+            r
+            for r in timeline.readings
+            if r.is_outbound and r.speed_mph >= self.min_ball_speed_mph
+        ]
+
+        if outbound:
+            peak = max(r.speed_mph for r in outbound)
+            logger.info("[TRIGGER] Ball detected: %.1f mph in capture", peak)
+            return capture
+
+        logger.info("[TRIGGER] No speed >= %.1f mph in capture", self.min_ball_speed_mph)
+        self._append_capture_diagnostic(
+            reason="no_ball_speed",
+            response_bytes=result.response_bytes,
+            trigger_latency_ms=result.capture_latency_ms,
+            timeline=timeline,
+        )
+        return None
+
     def reset(self):
-        """Reset trigger state and mark for reconfiguration."""
+        """Clear the saved club reading without reconfiguring active speed mode."""
         self._last_trigger_speed = 0
-        self._needs_reconfigure = True
 
     @property
     def last_trigger_speed(self) -> float:
@@ -1135,20 +1294,163 @@ class SoundTrigger(TriggerStrategy):
         pass  # No state to reset
 
 
-def create_trigger(trigger_type: str = "speed", **kwargs) -> TriggerStrategy:
+class HardwareTriggeredCapture(SoundTrigger):
+    """Use the OPS243's built-in speed trigger and rolling-buffer dump.
+
+    The radar is configured once with ``STn`` and captures its own rolling
+    buffer when that threshold is crossed.  Python only receives the completed
+    dump, parses it, and re-arms the board with ``GC`` for the next shot.
+    """
+
+    def __init__(
+        self,
+        trigger_threshold_mph: float = 25.0,
+        min_ball_speed_mph: float = 35.0,
+        pre_trigger_segments: int = 16,
+        trigger_magnitude: int = 40,
+        sample_rate_ksps: int = 30,
+    ):
+        super().__init__(pre_trigger_segments=pre_trigger_segments)
+        self.trigger_threshold_mph = trigger_threshold_mph
+        if not 1 <= trigger_magnitude <= 2000:
+            raise ValueError("Trigger magnitude must be between 1 and 2000")
+        self.trigger_magnitude = trigger_magnitude
+        self.min_ball_speed_mph = min_ball_speed_mph
+        self.sample_rate_ksps = sample_rate_ksps
+
+    def wait_for_raw_capture(
+        self,
+        radar: "OPS243Radar",
+        processor: RollingBufferProcessor,
+        timeout: float = 30.0,
+        raw_capture_callback: Optional[RawCaptureCallback] = None,
+    ) -> Optional[RawCaptureResult]:
+        """Wait for one board-triggered I/Q dump without applying a ball gate."""
+        logger.info(
+            "[TRIGGER] Waiting for OPS hardware trigger > %.1f mph (timeout=%.0fs)...",
+            self.trigger_threshold_mph,
+            timeout,
+        )
+        started_at = time.time()
+        response = radar.wait_for_hardware_trigger(timeout=timeout)
+        if not response:
+            logger.info("[TRIGGER] OPS hardware trigger timeout — no dump received")
+            return None
+
+        response_bytes = len(response)
+        first_byte_timestamp = getattr(radar, "last_hardware_trigger_first_byte_timestamp", None)
+        capture = processor.parse_capture(
+            response,
+            first_byte_timestamp=first_byte_timestamp,
+        )
+
+        # A received response proves a board trigger fired, even when it is
+        # malformed.  Parse before this re-arm so the raw response is retained.
+        radar.rearm_internal_speed_trigger(self.sample_rate_ksps)
+
+        capture_latency_ms = (time.time() - started_at) * 1000.0
+        if capture is None:
+            self._append_diagnostic(
+                accepted=False,
+                reason="parse_failed",
+                response_bytes=response_bytes,
+                trigger_latency_ms=capture_latency_ms,
+            )
+            return RawCaptureResult(
+                capture=None,
+                trigger_speed_mph=None,
+                trigger_timestamp=time.time(),
+                response_bytes=response_bytes,
+                capture_latency_ms=capture_latency_ms,
+                trigger_threshold_mph=self.trigger_threshold_mph,
+                failure_reason="parse_failed",
+            )
+
+        # Re-use the hardware-trigger timestamp refinement shared by the
+        # existing sound path.  Its first-byte estimate remains the fallback.
+        self._select_clock_sync_for_capture(radar, capture)
+        trigger_timestamp = capture.trigger_timestamp or time.time()
+        result = RawCaptureResult(
+            capture=capture,
+            trigger_speed_mph=None,
+            trigger_timestamp=trigger_timestamp,
+            response_bytes=response_bytes,
+            capture_latency_ms=capture_latency_ms,
+            trigger_threshold_mph=self.trigger_threshold_mph,
+            board_timeline=capture.board_timeline,
+        )
+        if raw_capture_callback is not None:
+            try:
+                raw_capture_callback(result)
+            except Exception:  # pylint: disable=broad-except
+                logger.exception("[TRIGGER] Raw-capture callback failed")
+        return result
+
+    def wait_for_trigger(
+        self,
+        radar: "OPS243Radar",
+        processor: RollingBufferProcessor,
+        timeout: float = 30.0,
+        raw_capture_callback: Optional[RawCaptureCallback] = None,
+    ) -> Optional[IQCapture]:
+        """Return a board-triggered capture that passes the legacy ball gate."""
+        result = self.wait_for_raw_capture(
+            radar,
+            processor,
+            timeout,
+            raw_capture_callback=raw_capture_callback,
+        )
+        if result is None:
+            return None
+        if result.capture is None:
+            return None
+
+        capture = result.capture
+        summary = self._summarize_capture_activity(processor, capture)
+        valid_outbound = [
+            speed
+            for speed in summary["all_outbound_speeds"]
+            if speed >= self.min_ball_speed_mph
+        ]
+        if not valid_outbound:
+            self._append_activity_diagnostic(
+                summary,
+                accepted=False,
+                reason="no_ball_speed",
+                response_bytes=result.response_bytes,
+                trigger_latency_ms=result.capture_latency_ms,
+            )
+            logger.info(
+                "[TRIGGER] OPS hardware capture rejected — no speed >= %.1f mph",
+                self.min_ball_speed_mph,
+            )
+            return None
+
+        # Do not emit an accepted diagnostic here.  This only establishes that
+        # the board delivered a plausible raw capture; the monitor still has
+        # to process it and validate the resulting Shot.  Emitting one here
+        # and another after that validation made the UI count every hardware
+        # dump twice.  Rejections above remain diagnostics because no final
+        # Shot diagnostic will follow them.
+        return capture
+
+
+def create_trigger(trigger_type: str = "hardware", **kwargs) -> TriggerStrategy:
     """
     Factory function to create trigger strategy.
 
     Args:
-        trigger_type: "speed" (recommended), "polling", "threshold", "manual",
-                      "sound", or "sound-gpio"
+        trigger_type: "hardware" (recommended), "speed", "polling",
+                      "threshold", "manual", "sound", or "sound-gpio"
         **kwargs: Arguments passed to trigger constructor
 
     Returns:
         Configured TriggerStrategy instance
 
     Trigger types:
-        - "speed": Fast speed detection triggers rolling buffer capture.
+        - "hardware": OPS243 built-in speed trigger drives the rolling-buffer
+          dump directly.
+        - "speed": Fast host-polled speed detection triggers rolling buffer capture.
                    Recommended by OmniPreSense for golf. ~5-6ms response time.
         - "polling": Continuously capture and check for activity. Simple but slow.
         - "threshold": Speed threshold triggers capture. Less efficient than "speed".
@@ -1160,6 +1462,7 @@ def create_trigger(trigger_type: str = "speed", **kwargs) -> TriggerStrategy:
                         Requires gpiozero library.
     """
     triggers = {
+        "hardware": HardwareTriggeredCapture,
         "speed": SpeedTriggeredCapture,
         "polling": PollingTrigger,
         "threshold": ThresholdTrigger,

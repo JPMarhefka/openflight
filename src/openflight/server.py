@@ -816,6 +816,30 @@ def _session_start_config() -> dict:
     return config
 
 
+def _sigmf_capture_config(args) -> dict:
+    """Return a JSON-safe, secret-free snapshot of the effective CLI config."""
+    config = {}
+    for key, value in vars(args).items():
+        if "key" in key.lower() or "password" in key.lower() or "token" in key.lower():
+            config[key] = "[redacted]" if value else None
+        else:
+            config[key] = value
+
+    # The host speed-trigger path intentionally changes the requested split
+    # to S#0 after detecting the club. Record what the radar actually used.
+    effective_pre = 0 if args.trigger == "speed" else args.pre_trigger_segments
+    config.update(
+        {
+            "effective_pre_trigger_segments": effective_pre,
+            "effective_post_trigger_segments": 32 - effective_pre,
+            "effective_buffer_segments": 32,
+            "effective_sample_rate_ksps": args.sample_rate,
+        }
+    )
+    config["kld7_radc_tuning"] = dict(active_kld7_radc_tuning)
+    return config
+
+
 ball_speed_correction_enabled = False
 ball_speed_correction_distance_ft = 5.5
 ball_speed_correction_ball_above_radar_ft = -4.0 / 12.0
@@ -2526,11 +2550,14 @@ def on_shot_detected(shot: Shot):
 def start_monitor(
     port: Optional[str] = None,
     mock: bool = False,
-    trigger_type: str = "polling",
+    trigger_type: str = "hardware",
     debug: bool = False,
     trigger_kwargs: Optional[dict] = None,
     sample_rate_ksps: int = 30,
     ops_baud: Optional[int] = None,
+    sigmf_capture_dir: Optional[Path] = None,
+    capture_configuration: Optional[dict] = None,
+    board_processing_enabled: bool = False,
 ):
     """
     Start the launch monitor in rolling buffer mode.
@@ -2538,11 +2565,16 @@ def start_monitor(
     Args:
         port: Serial port for radar
         mock: Run in mock mode without radar
-        trigger_type: Trigger strategy (sound, speed, polling)
+        trigger_type: Trigger strategy (hardware, sound, speed, polling)
         debug: Enable verbose debug output
         ops_baud: Target UART baud when the OPS243 is on the GPIO header
     """
     global monitor, mock_mode  # pylint: disable=global-statement
+
+    if trigger_type in {"speed", "hardware"} and sample_rate_ksps != 30:
+        raise ValueError("Speed and hardware trigger modes each require a 30 ksps sample rate")
+    if sigmf_capture_dir is not None and (mock or trigger_type not in {"speed", "hardware"}):
+        raise ValueError("SigMF capture requires a non-mock speed or hardware trigger")
 
     # Stop any existing monitor first
     if monitor is not None:
@@ -2561,6 +2593,9 @@ def start_monitor(
             trigger_type=trigger_type,
             sample_rate_ksps=sample_rate_ksps,
             ops_baud=ops_baud,
+            sigmf_capture_dir=sigmf_capture_dir,
+            capture_configuration=capture_configuration,
+            board_processing_enabled=board_processing_enabled,
             **(trigger_kwargs or {}),
         )
         print(
@@ -2956,6 +2991,10 @@ def main():
     parser.add_argument(
         "--log-dir", help="Directory for session logs (default: ~/openflight_sessions)"
     )
+    parser.add_argument(
+        "--sigmf-capture-dir",
+        help="Write every complete speed-triggered raw I/Q capture as SigMF into this directory",
+    )
     parser.add_argument("--no-logging", action="store_true", help="Disable session logging")
     parser.add_argument(
         "--sim",
@@ -2975,12 +3014,28 @@ def main():
     )
     parser.add_argument(
         "--trigger",
-        choices=["polling", "threshold", "speed", "sound"],
-        default="polling",
-        help="Trigger strategy (default: polling)",
+        choices=["hardware", "polling", "threshold", "speed", "sound"],
+        default="hardware",
+        help="Trigger strategy (default: hardware)",
     )
     parser.add_argument(
+        "--trigger-threshold",
+        "--speed-trigger-threshold",
+        dest="trigger_threshold",
+        type=float,
+        default=25.0,
+        help="Internal or host speed threshold in mph (default: 25)",
+    )
+    parser.add_argument(
+        "--trigger-magnitude",
+        type=int,
+        default=40,
+        help="OPS243 internal hardware-trigger magnitude SMn, 1-2000 (default: 40)",
+    )
+    parser.add_argument(
+        "--pre-trigger-segments",
         "--sound-pre-trigger",
+        dest="pre_trigger_segments",
         type=int,
         default=16,
         help=(
@@ -3078,6 +3133,11 @@ def main():
             "Positive means boresight points right of the target line. Added to the "
             "measured club path; 0 reports club path relative to boresight."
         ),
+    )
+    parser.add_argument(
+        "--board-processing",
+        action="store_true",
+        help="Enable OPS243 SZ continuous-sampling frame-window speed/magnitude output",
     )
     parser.add_argument(
         "--kld7",
@@ -3250,6 +3310,17 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.trigger_threshold < 0:
+        parser.error("--trigger-threshold must be non-negative")
+    if not 1 <= args.trigger_magnitude <= 2000:
+        parser.error("--trigger-magnitude must be between 1 and 2000")
+    if args.trigger in {"speed", "hardware"} and args.sample_rate != 30:
+        parser.error("--trigger speed and hardware require --sample-rate 30")
+    if args.sigmf_capture_dir and args.trigger not in {"speed", "hardware"}:
+        parser.error("--sigmf-capture-dir requires --trigger speed or hardware")
+    if args.sigmf_capture_dir and args.mock:
+        parser.error("--sigmf-capture-dir cannot be used with --mock")
+
     # Mount tilt cannot be defaulted safely (a wrong value silently biases the
     # launch angle), so require it whenever the K-LD7 radars are enabled.
     if args.kld7 and args.kld7_mount_tilt is None:
@@ -3339,8 +3410,16 @@ def main():
         print("Raw radar readings display ENABLED - signed speed values will be shown")
 
     # Start the monitor
-    # Build trigger-specific kwargs (pre_trigger_segments always passed)
-    trigger_kwargs = {"pre_trigger_segments": args.sound_pre_trigger}
+    if args.trigger == "speed":
+        trigger_kwargs = {"min_trigger_speed_mph": args.trigger_threshold}
+    elif args.trigger == "hardware":
+        trigger_kwargs = {
+            "trigger_threshold_mph": args.trigger_threshold,
+            "pre_trigger_segments": args.pre_trigger_segments,
+            "trigger_magnitude": args.trigger_magnitude,
+        }
+    else:
+        trigger_kwargs = {"pre_trigger_segments": args.pre_trigger_segments}
 
     # Initialize camera BEFORE starting monitor (so session log is accurate)
     if not args.no_camera:
@@ -3462,6 +3541,9 @@ def main():
         trigger_kwargs=trigger_kwargs,
         sample_rate_ksps=args.sample_rate,
         ops_baud=args.ops_baud,
+        sigmf_capture_dir=(Path(args.sigmf_capture_dir).expanduser() if args.sigmf_capture_dir else None),
+        capture_configuration=_sigmf_capture_config(args),
+        board_processing_enabled=args.board_processing,
     )
 
     # Simulator connectors (off unless --sim). Started after the monitor exists

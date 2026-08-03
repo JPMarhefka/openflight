@@ -132,7 +132,7 @@ uv run python scripts/hardware-test/test_rolling_buffer_persist.py --test
 ### Running the Application
 
 ```bash
-scripts/start-kiosk.sh              # Default: rolling buffer + sound trigger
+scripts/start-kiosk.sh              # Default: >25 mph speed trigger + rolling buffer
 scripts/start-kiosk.sh --mock       # Development mode without hardware
 scripts/start-kiosk.sh --kld7                          # With K-LD7 angle radars (deprecated; auto-detects horizontal)
 ```
@@ -152,7 +152,7 @@ uv run python scripts/hardware-test/test_sound_trigger_hardware.py
 ```
 React UI (WebSocket) ──► Flask Server ──► RollingBufferMonitor ──► OPS243Radar
                               │                │
-                              │                └── SoundTrigger (SEN-14262 → HOST_INT)
+                              │                └── SpeedTrigger (>25 mph, then S#0 capture)
                               │
                               ├── KLD7Tracker (vertical, RADC → launch angle)
                               ├── KLD7Tracker (horizontal, RADC → aim direction)
@@ -162,8 +162,8 @@ React UI (WebSocket) ──► Flask Server ──► RollingBufferMonitor ─�
 
 ### Data Flow
 
-1. **SoundTrigger** detects club impact via SEN-14262 GATE → OPS243 HOST_INT
-2. **OPS243Radar** (`ops243.py`) dumps rolling buffer I/Q data (4096 samples)
+1. **SpeedTrigger** detects an outbound club report greater than 25 mph
+2. **OPS243Radar** switches to `S#0` and captures 4096 post-trigger I/Q samples
 3. **RollingBufferProcessor** (`rolling_buffer/processor.py`) runs FFT + mode-based speed extraction
 4. Creates `Shot` object with ball_speed, club_speed, spin, carry
 5. **KLD7Trackers** extract launch angle (vertical) and aim direction (horizontal) from RADC phase interferometry, filtered by OPS243 ball speed
@@ -182,7 +182,7 @@ React UI (WebSocket) ──► Flask Server ──► RollingBufferMonitor ─�
 
 ### Processing Mode
 
-**Rolling Buffer** is the default and only production mode. The OPS243-A continuously buffers I/Q data. When the sound trigger fires, the buffer is dumped and analyzed for ball speed, club speed, and spin rate. K-LD7 data is correlated via the OPS243 impact timestamp.
+**Rolling Buffer** is the default and only production capture mode. The OPS243-A waits in fast normal speed mode, then an outbound club report greater than 25 mph starts an `S#0` rolling-buffer capture. The raw data is analyzed for ball speed, club speed, and spin rate. K-LD7 data is correlated via the OPS243 impact timestamp.
 
 ## Key Constants
 
@@ -205,7 +205,7 @@ Logs written to `~/openflight_sessions/session_*.jsonl` with entry types:
 - `trigger_event` - Trigger accept/reject with latency (for rolling buffer mode)
 - `rolling_buffer_capture` - Raw I/Q samples (4096 each) for offline analysis
 
-## Sound Trigger Hardware
+## Optional Legacy Sound Trigger Hardware
 
 The SparkFun SEN-14262 detects club impact and triggers the OPS243-A via HOST_INT.
 

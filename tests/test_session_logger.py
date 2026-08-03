@@ -284,12 +284,20 @@ class TestLogShot:
             trigger_timestamp_source="ops_clock_sync",
             clock_sync_offset_s=1234567790.114,
             post_trigger_duration_ms=68.0,
+            board_output_file="hit-0001/board-speed-magnitude.jsonl",
+            board_record_count=56,
+            board_processing_enabled=True,
+            board_unit="mps",
+            board_peak_speed=1.09,
+            board_peak_magnitude=33.0,
         )
 
         lines = logger.session_path.read_text().strip().split("\n")
         entry = json.loads(lines[-1])
 
         assert entry["type"] == "rolling_buffer_capture"
+        assert entry["i_samples"] == [2048] * 4
+        assert entry["q_samples"] == [2048] * 4
         assert entry["first_byte_timestamp"] == 1234567890.25
         assert entry["trigger_timestamp"] == 1234567890.182
         assert entry["trigger_timestamp_source"] == "ops_clock_sync"
@@ -297,6 +305,12 @@ class TestLogShot:
         assert entry["trigger_timestamp_delta_from_first_byte_ms"] == 0.0
         assert entry["clock_sync_offset_s"] == 1234567790.114
         assert entry["post_trigger_duration_ms"] == 68.0
+        assert entry["board_output_file"] == "hit-0001/board-speed-magnitude.jsonl"
+        assert entry["board_record_count"] == 56
+        assert entry["board_processing_enabled"] is True
+        assert entry["board_unit"] == "mps"
+        assert entry["board_peak_speed"] == 1.09
+        assert entry["board_peak_magnitude"] == 33.0
 
 
 class TestLogKld7Buffer:

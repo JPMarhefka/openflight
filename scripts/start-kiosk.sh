@@ -18,10 +18,16 @@ DEBUG_MODE=false
 NO_CAMERA=true  # Camera disabled by default (K-LD7 radar handles angle)
 TRACKMAN_TEST=false
 SESSION_LOCATION=""
+# Keep a raw I/Q session alongside normal local session logs by default.
+# Set OPENFLIGHT_SIGMF_DIR or pass --sigmf-capture-dir to use another location.
+SIGMF_CAPTURE_DIR="${OPENFLIGHT_SIGMF_DIR:-$HOME/openflight_sessions/range-sigmf}"
 DRY_RUN=false
 # Rolling buffer mode is the only mode (streaming mode removed)
-TRIGGER="sound"  # Default: hardware sound trigger (SEN-14262 → HOST_INT)
-SOUND_PRE_TRIGGER=""
+TRIGGER="hardware"  # Default: OPS243 internal speed trigger
+TRIGGER_THRESHOLD=25
+TRIGGER_MAGNITUDE=40
+PRE_TRIGGER_SEGMENTS=4  # S#4: post-heavy window for maximum post-impact data
+BOARD_PROCESSING=true   # OPS243 SZ frame-window speed/magnitude output
 BUFFER_SPLIT=""
 IWR6843=false
 IWR6843_PORT=""
@@ -61,6 +67,12 @@ EXPERIMENTAL_KLD7_HORIZONTAL_ANGLE_LIMIT=""
 BALLISTICS=false
 SIM=false
 CALCULATED_SPIN=false
+HOTSPOT=false
+HOTSPOT_CONNECTION="OpenFlight-Launch-Dev"
+HOTSPOT_INTERFACE="wlan0"
+HOTSPOT_SSID="Launch_Dev"
+HOTSPOT_PASSWORD='Jetson1$'
+HOTSPOT_ADDRESS="10.42.0.1/24"
 
 # Buffer split presets (pre/post trigger segments out of 32 total)
 # At 20ksps: each segment = 6.4ms, total buffer = 204.8ms
@@ -101,8 +113,16 @@ while [[ $# -gt 0 ]]; do
             DRY_RUN=true
             shift
             ;;
+        --hotspot)
+            HOTSPOT=true
+            shift
+            ;;
         --session-location|-l)
             SESSION_LOCATION="$2"
+            shift 2
+            ;;
+        --sigmf-capture-dir)
+            SIGMF_CAPTURE_DIR="$2"
             shift 2
             ;;
         --no-camera)
@@ -117,8 +137,24 @@ while [[ $# -gt 0 ]]; do
             TRIGGER="$2"
             shift 2
             ;;
-        --sound-pre-trigger)
-            SOUND_PRE_TRIGGER="$2"
+        --trigger-threshold|--speed-trigger-threshold)
+            TRIGGER_THRESHOLD="$2"
+            shift 2
+            ;;
+        --trigger-magnitude)
+            TRIGGER_MAGNITUDE="$2"
+            shift 2
+            ;;
+        --no-board-processing)
+            BOARD_PROCESSING=false
+            shift
+            ;;
+        --board-processing)
+            BOARD_PROCESSING=true
+            shift
+            ;;
+        --pre-trigger-segments|--sound-pre-trigger)
+            PRE_TRIGGER_SEGMENTS="$2"
             shift 2
             ;;
         --buffer-split)
@@ -303,9 +339,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Resolve buffer split preset to a number (overrides --sound-pre-trigger)
+# Resolve buffer split preset to a number (overrides --pre-trigger-segments)
 if [ -n "$BUFFER_SPLIT" ]; then
-    SOUND_PRE_TRIGGER=$(resolve_buffer_split "$BUFFER_SPLIT")
+    PRE_TRIGGER_SEGMENTS=$(resolve_buffer_split "$BUFFER_SPLIT")
 fi
 
 if [ "$TRACKMAN_TEST" = true ]; then
@@ -356,6 +392,76 @@ cleanup() {
     pkill -f "chromium.*--kiosk" 2>/dev/null || true
     pkill -f "chrome.*--kiosk" 2>/dev/null || true
     exit 0
+}
+
+configure_hotspot() {
+    if [ "$HOTSPOT" != true ]; then
+        return 0
+    fi
+
+    if [ "$(uname -s)" != "Linux" ]; then
+        error "--hotspot requires Raspberry Pi Linux with NetworkManager"
+        return 1
+    fi
+    if ! command -v nmcli >/dev/null 2>&1; then
+        error "--hotspot requires nmcli (NetworkManager)"
+        error "  Install it with: sudo apt install network-manager"
+        return 1
+    fi
+    nmcli_run() {
+        if [ "$(id -u)" -eq 0 ]; then
+            nmcli "$@"
+        else
+            sudo -n nmcli "$@"
+        fi
+    }
+
+    if ! nmcli_run general status >/dev/null 2>&1; then
+        error "NetworkManager is not running; cannot enable hotspot"
+        error "  Check with: systemctl status NetworkManager"
+        error "  If started by the X1202 button, rerun the button installer to configure nmcli permissions"
+        return 1
+    fi
+    if ! nmcli_run device show "$HOTSPOT_INTERFACE" >/dev/null 2>&1; then
+        error "Wi-Fi interface not found: $HOTSPOT_INTERFACE"
+        return 1
+    fi
+
+    if [ -n "${SSH_CONNECTION:-}" ]; then
+        local ssh_peer
+        ssh_peer=$(awk '{print $1}' <<<"$SSH_CONNECTION")
+        if command -v ip >/dev/null 2>&1 && ip route get "$ssh_peer" 2>/dev/null | grep -q " dev $HOTSPOT_INTERFACE\b"; then
+            warn "SSH appears to use $HOTSPOT_INTERFACE; enabling the hotspot may disconnect this session"
+            warn "Prefer Ethernet or start via the X1202 button for unattended startup"
+        fi
+    fi
+
+    if ! nmcli_run -t --escape no -f NAME connection show | grep -Fxq "$HOTSPOT_CONNECTION"; then
+        nmcli_run connection add type wifi ifname "$HOTSPOT_INTERFACE" \
+            con-name "$HOTSPOT_CONNECTION" ssid "$HOTSPOT_SSID" >/dev/null
+    fi
+
+    nmcli_run connection modify "$HOTSPOT_CONNECTION" \
+        connection.interface-name "$HOTSPOT_INTERFACE" \
+        802-11-wireless.mode ap \
+        802-11-wireless.ssid "$HOTSPOT_SSID" \
+        802-11-wireless.band bg \
+        wifi-sec.key-mgmt wpa-psk \
+        wifi-sec.psk "$HOTSPOT_PASSWORD" \
+        ipv4.method shared \
+        ipv4.addresses "$HOTSPOT_ADDRESS" \
+        ipv6.method disabled \
+        connection.autoconnect no
+    nmcli_run connection up "$HOTSPOT_CONNECTION" ifname "$HOTSPOT_INTERFACE" >/dev/null
+
+    local hotspot_ip
+    hotspot_ip=$(nmcli_run -g IP4.ADDRESS device show "$HOTSPOT_INTERFACE" | awk -F/ 'NF { print $1; exit }')
+    hotspot_ip="${hotspot_ip:-${HOTSPOT_ADDRESS%/*}}"
+    log "Hotspot enabled"
+    log "SSID: $HOTSPOT_SSID"
+    log "Password: $HOTSPOT_PASSWORD"
+    log "Hotspot IP: $hotspot_ip"
+    log "OpenFlight UI: http://$hotspot_ip:$PORT"
 }
 
 configure_kld7_latency() {
@@ -442,8 +548,20 @@ if [ -n "$TRIGGER" ]; then
     SERVER_CMD="$SERVER_CMD --trigger $TRIGGER"
 fi
 
-if [ -n "$SOUND_PRE_TRIGGER" ]; then
-    SERVER_CMD="$SERVER_CMD --sound-pre-trigger $SOUND_PRE_TRIGGER"
+if [ "$TRIGGER" = "speed" ] || [ "$TRIGGER" = "hardware" ]; then
+    SERVER_CMD="$SERVER_CMD --trigger-threshold $TRIGGER_THRESHOLD"
+fi
+
+if [ "$TRIGGER" = "hardware" ]; then
+    SERVER_CMD="$SERVER_CMD --trigger-magnitude $TRIGGER_MAGNITUDE"
+fi
+
+if [ "$BOARD_PROCESSING" = true ]; then
+    SERVER_CMD="$SERVER_CMD --board-processing"
+fi
+
+if [ "$TRIGGER" = "hardware" ] || [ "$TRIGGER" = "sound" ]; then
+    SERVER_CMD="$SERVER_CMD --pre-trigger-segments $PRE_TRIGGER_SEGMENTS"
 fi
 
 if [ -n "$SAMPLE_RATE" ]; then
@@ -546,9 +664,18 @@ if [ "$KLD7" = true ]; then
 fi
 
 if [ "$DRY_RUN" = true ]; then
-    echo "$SERVER_CMD"
+    if [ "$HOTSPOT" = true ]; then
+        echo "hotspot: enabled (SSID=$HOTSPOT_SSID, interface=$HOTSPOT_INTERFACE, address=$HOTSPOT_ADDRESS)"
+    fi
+    if [ -n "$SIGMF_CAPTURE_DIR" ]; then
+        printf '%s --sigmf-capture-dir %q\n' "$SERVER_CMD" "$SIGMF_CAPTURE_DIR"
+    else
+        echo "$SERVER_CMD"
+    fi
     exit 0
 fi
+
+configure_hotspot
 
 # Ensure the environment is in sync (uv recreates/repairs .venv as needed,
 # so a moved project dir self-heals instead of failing with "command not found")
@@ -599,8 +726,8 @@ else
     if [ -n "$TRIGGER" ]; then
         log "Trigger: $TRIGGER"
     fi
-    if [ -n "$SOUND_PRE_TRIGGER" ]; then
-        log "Buffer split: S#$SOUND_PRE_TRIGGER ($SOUND_PRE_TRIGGER pre / $((32 - SOUND_PRE_TRIGGER)) post segments)"
+    if [ "$TRIGGER" = "sound" ] || [ "$TRIGGER" = "hardware" ]; then
+        log "Buffer split: S#$PRE_TRIGGER_SEGMENTS ($PRE_TRIGGER_SEGMENTS pre / $((32 - PRE_TRIGGER_SEGMENTS)) post segments)"
     fi
 fi
 
@@ -616,6 +743,10 @@ if [ "$KLD7" = true ]; then
     warn "K-LD7 angle radars are deprecated (superseded by a more capable radar chip)"
 fi
 
+if [ -n "$SIGMF_CAPTURE_DIR" ]; then
+    log "SigMF raw I/Q capture enabled: $SIGMF_CAPTURE_DIR"
+fi
+
 if [ "$NO_CAMERA" = true ]; then
     log "Camera disabled"
 else
@@ -628,7 +759,11 @@ else
     log "Ballistic carry model disabled (using legacy table)"
 fi
 
-uv run $SERVER_CMD &
+if [ -n "$SIGMF_CAPTURE_DIR" ]; then
+    uv run $SERVER_CMD --sigmf-capture-dir "$SIGMF_CAPTURE_DIR" &
+else
+    uv run $SERVER_CMD &
+fi
 SERVER_PID=$!
 
 # Wait for server to be ready

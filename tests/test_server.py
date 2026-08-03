@@ -19,6 +19,7 @@ from openflight.server import (
     on_shot_detected,
     radar_launch_is_plausible,
     shot_to_dict,
+    start_monitor,
 )
 
 
@@ -326,11 +327,85 @@ class TestIWR6843ShotIntegration:
         assert shot.launch_angle_vertical is None
 
 
+def test_speed_trigger_rejects_non_30ksps_processing_rate():
+    """Speed captures are always 30 ksps, so processing must use the same rate."""
+    with pytest.raises(ValueError, match="require a 30 ksps"):
+        start_monitor(trigger_type="speed", sample_rate_ksps=25)
+
+    with pytest.raises(ValueError, match="require a 30 ksps"):
+        start_monitor(trigger_type="hardware", sample_rate_ksps=25)
+
+
+def test_hardware_start_monitor_passes_sample_rate_only_to_monitor(monkeypatch):
+    """Hardware startup must not duplicate sample_rate_ksps via trigger kwargs."""
+    captured = {}
+
+    class FakeMonitor:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def connect(self):
+            return True
+
+        def start(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr("openflight.rolling_buffer.RollingBufferMonitor", FakeMonitor)
+    monkeypatch.setattr(server_module, "get_session_logger", lambda: None)
+    monkeypatch.setattr(server_module, "monitor", None)
+
+    start_monitor(
+        trigger_type="hardware",
+        sample_rate_ksps=30,
+        trigger_kwargs={
+            "trigger_threshold_mph": 25,
+            "pre_trigger_segments": 16,
+            "trigger_magnitude": 40,
+        },
+    )
+
+    assert captured["sample_rate_ksps"] == 30
+    assert captured["trigger_threshold_mph"] == 25
+    assert captured["pre_trigger_segments"] == 16
+    assert captured["trigger_magnitude"] == 40
+
+
+def test_sigmf_capture_rejects_mock_mode(tmp_path):
+    """A mock monitor cannot produce real OPS243 SigMF recordings."""
+    with pytest.raises(ValueError, match="non-mock speed or hardware trigger"):
+        start_monitor(mock=True, sigmf_capture_dir=tmp_path)
+
+
+def test_sigmf_capture_rejects_unsupported_trigger(tmp_path):
+    """SigMF recording requires a raw-I/Q-producing trigger strategy."""
+    with pytest.raises(ValueError, match="non-mock speed or hardware trigger"):
+        start_monitor(trigger_type="sound", sigmf_capture_dir=tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (["--mock", "--sigmf-capture-dir", "/tmp/sigmf"], "cannot be used with --mock"),
+        (["--trigger", "sound", "--sigmf-capture-dir", "/tmp/sigmf"], "requires --trigger speed or hardware"),
+    ],
+)
+def test_server_cli_rejects_unsupported_sigmf_modes(monkeypatch, capsys, arguments, message):
+    """Argparse rejects invalid SigMF combinations before any hardware startup."""
+    monkeypatch.setattr(sys, "argv", ["openflight-server", *arguments])
+
+    with pytest.raises(SystemExit) as exit_info:
+        server_module.main()
+
+    assert exit_info.value.code == 2
+    assert message in capsys.readouterr().err
+
+
 class TestSessionErrorLogging:
     """Session JSONL should record shot-pipeline failures, not only Python logs."""
 
     def test_on_shot_detected_logs_kld7_processing_error(self, monkeypatch):
         logged_errors = []
+        emitted = []
 
         class FailingTracker:
             orientation = "vertical"
@@ -359,7 +434,9 @@ class TestSessionErrorLogging:
             "log_session_error",
             lambda error, **kwargs: logged_errors.append((error, kwargs)),
         )
-        monkeypatch.setattr(server_module.socketio, "emit", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            server_module.socketio, "emit", lambda *args, **kwargs: emitted.append((args, kwargs))
+        )
 
         shot = Shot(
             ball_speed_mph=150.0,
@@ -374,6 +451,10 @@ class TestSessionErrorLogging:
         assert logged_errors[0][1]["component"] == "server"
         assert logged_errors[0][1]["context"]["stage"] == "angle_postprocessing"
         assert logged_errors[0][1]["exc"].__class__.__name__ == "RuntimeError"
+        shot_event = next(args for args, _kwargs in emitted if args[0] == "shot")
+        assert set(shot_event[1]) == {"shot", "stats"}
+        assert "i_samples" not in shot_event[1]["shot"]
+        assert "q_samples" not in shot_event[1]["shot"]
 
     def test_set_radar_config_logs_failure_to_session(self, monkeypatch):
         logged_errors = []

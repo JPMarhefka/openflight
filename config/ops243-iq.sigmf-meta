@@ -1,0 +1,24 @@
+{
+  "global": {
+    "core:datatype": "ci16_le",
+    "core:sample_rate": 30000,
+    "core:hw": "OmniPreSense OPS243-A Doppler radar",
+    "core:recorder": "OpenFlight OPS243 SigMF recorder",
+    "core:description": "Raw 12-bit OPS243 I/Q ADC counts stored losslessly as ci16_le.",
+    "core:version": "1.2.6",
+    "core:extensions": [
+      {
+        "name": "openflight",
+        "version": "1.0.0",
+        "optional": false
+      }
+    ]
+  },
+  "captures": [
+    {
+      "core:sample_start": 0,
+      "core:frequency": 24125000000
+    }
+  ],
+  "annotations": []
+}

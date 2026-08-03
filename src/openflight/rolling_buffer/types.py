@@ -7,7 +7,65 @@ the processed speed timeline, and spin detection results.
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
+
+
+@dataclass
+class BoardSpeedMagnitudeRecord:
+    """One speed/magnitude record produced by OPS243 firmware processing."""
+
+    timestamp: float
+    unit: Optional[str]
+    magnitudes: List[float]
+    speeds: List[float]
+
+    def to_dict(self, sample_time: Optional[float] = None) -> Dict[str, Any]:
+        """Serialize the record while retaining board-native values."""
+        data: Dict[str, Any] = {
+            "time": self.timestamp,
+            "unit": self.unit,
+            "magnitude": list(self.magnitudes),
+            "speed": list(self.speeds),
+        }
+        if sample_time is not None:
+            data["time_offset_ms"] = (self.timestamp - sample_time) * 1000.0
+        return data
+
+
+@dataclass
+class BoardProcessedTimeline:
+    """Optional OPS243 on-board speed/magnitude output for one capture."""
+
+    records: List[BoardSpeedMagnitudeRecord] = field(default_factory=list)
+    metadata: List[Dict[str, Any]] = field(default_factory=list)
+    sample_time: Optional[float] = None
+    trigger_time: Optional[float] = None
+    processing_enabled: bool = False
+
+    @property
+    def record_count(self) -> int:
+        """Number of board-produced speed/magnitude records."""
+        return len(self.records)
+
+    @property
+    def units(self) -> Optional[str]:
+        """First native unit reported by the board, if present."""
+        for record in self.records:
+            if record.unit:
+                return record.unit
+        return None
+
+    @property
+    def peak_speed(self) -> Optional[float]:
+        """Largest absolute native speed across all board records."""
+        values = [abs(speed) for record in self.records for speed in record.speeds]
+        return max(values) if values else None
+
+    @property
+    def peak_magnitude(self) -> Optional[float]:
+        """Largest native magnitude across all board records."""
+        values = [magnitude for record in self.records for magnitude in record.magnitudes]
+        return max(values) if values else None
 
 
 @dataclass
@@ -39,6 +97,7 @@ class IQCapture:
     trigger_timestamp: Optional[float] = None
     trigger_timestamp_source: Optional[str] = None
     clock_sync_offset_s: Optional[float] = None
+    board_timeline: Optional[BoardProcessedTimeline] = None
 
     def __post_init__(self) -> None:
         """Infer the hardware trigger epoch when first-byte timing is available."""

@@ -27,14 +27,19 @@ from .monitor import (
 )
 from .processor import RollingBufferProcessor
 from .trigger import (
+    HardwareTriggeredCapture,
     ManualTrigger,
     PollingTrigger,
+    RawCaptureResult,
     SpeedTriggeredCapture,
+    SpeedTriggeredCaptureResult,
     ThresholdTrigger,
     TriggerStrategy,
     create_trigger,
 )
 from .types import (
+    BoardProcessedTimeline,
+    BoardSpeedMagnitudeRecord,
     ImpactEstimate,
     IQCapture,
     ProcessedCapture,
@@ -46,6 +51,8 @@ from .types import (
 
 __all__ = [
     # Types
+    "BoardProcessedTimeline",
+    "BoardSpeedMagnitudeRecord",
     "IQCapture",
     "ImpactEstimate",
     "SpeedReading",
@@ -57,10 +64,13 @@ __all__ = [
     "RollingBufferProcessor",
     # Triggers
     "TriggerStrategy",
+    "HardwareTriggeredCapture",
     "PollingTrigger",
     "ThresholdTrigger",
     "ManualTrigger",
     "SpeedTriggeredCapture",
+    "SpeedTriggeredCaptureResult",
+    "RawCaptureResult",
     "create_trigger",
     # Monitor
     "RollingBufferMonitor",

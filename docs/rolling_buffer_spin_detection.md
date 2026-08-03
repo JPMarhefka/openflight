@@ -67,16 +67,38 @@ The sensor returns JSON with:
 
 ## Triggering Strategy for Golf
 
-The radar needs a trigger to know when to dump the buffer. The recommended approach is a direct hardware trigger via HOST_INT.
+The production trigger is the OPS243's built-in speed trigger. OpenFlight first
+arms `PI -> ST25 -> GC -> S=30`, then restores its fast detector (`US`, `S(`,
+`X=2`, direction/filter and JSON settings), `S#16`, and `ST25`. This ordering
+is required because `GC` resets those detector settings on this firmware. The
+board freezes and dumps its own 4,096-sample I/Q rolling buffer at the threshold
+crossing, so the capture includes roughly 68 ms before and 68 ms after the
+trigger at 30 ksps. After each complete dump OpenFlight begins re-arm with
+`GC`, then reapplies the settings that this firmware clears on `GC`.
 
-> **Important: Persistent Mode Required.** The OPS243-A has a firmware bug where the HOST_INT pin mode switches when transitioning from normal mode (GS) to rolling buffer mode (GC) at runtime. The fix from OmniPreSense: save rolling buffer mode to persistent memory (`A!` command) and power cycle the board. After that, hardware triggers work correctly. See the [Radar Setup section](raspberry-pi-setup.md#radar-setup-one-time) in the Pi setup guide, or run:
+> **Legacy sound trigger only: persistent mode required.** The OPS243-A has a firmware bug where the HOST_INT pin mode switches when transitioning from normal mode (GS) to rolling buffer mode (GC) at runtime. The speed-trigger default does not use HOST_INT. For legacy hardware triggering, save rolling buffer mode to persistent memory (`A!` command) and power cycle the board. See the [Radar Setup section](raspberry-pi-setup.md#radar-setup-one-time) in the Pi setup guide, or run:
 > ```
 > uv run python scripts/hardware-test/test_rolling_buffer_persist.py --setup
 > # Power cycle the radar
 > uv run python scripts/hardware-test/test_rolling_buffer_persist.py --test
 > ```
 
-### 1. Direct Hardware Sound Trigger (Recommended)
+### 1. Internal OPS243 Trigger (Default)
+
+- No external trigger hardware required
+- Board-managed 25 mph speed threshold by default (`ST25`)
+- Balanced pre-/post-trigger I/Q window (`S#16`)
+- No host-side `S!` trigger latency or `S#0` post-only capture
+
+**Usage:**
+```bash
+./scripts/start-kiosk.sh
+
+# Optional threshold override
+./scripts/start-kiosk.sh --trigger-threshold 30 --pre-trigger-segments 20
+```
+
+### 2. Direct Hardware Sound Trigger (Legacy Option)
 
 Uses the SparkFun SEN-14262 sound detector wired directly to HOST_INT via a level shifter. The sound of club impact triggers the radar to dump its buffer. Near-zero latency (~10us).
 
@@ -89,23 +111,7 @@ See [sound-trigger-wiring.md](sound-trigger-wiring.md) for full circuit details.
 
 **Usage:**
 ```bash
-# Default mode in start-kiosk.sh
-./scripts/start-kiosk.sh
-
-# Or explicitly
-openflight-server --mode rolling-buffer --trigger sound
-```
-
-### 2. Speed Threshold Trigger
-
-- Configure minimum speed threshold (e.g., 50+ mph)
-- When club head is detected above threshold, trigger fires
-- Buffer contains pre-trigger (backswing) and post-trigger (impact + ball flight)
-- ~5-6ms response time per OmniPreSense
-
-**Usage:**
-```bash
-openflight-server --mode rolling-buffer --trigger speed
+./scripts/start-kiosk.sh --trigger sound
 ```
 
 ### 3. GPIO Software Trigger (Fallback)
@@ -132,8 +138,8 @@ openflight-server --mode rolling-buffer --trigger polling
 
 | Trigger Type | Latency | Hardware Required |
 |--------------|---------|-------------------|
-| `sound` | ~10μs | SEN-14262 + level shifter (recommended) |
-| `speed` | ~5-6ms | None (uses radar detection) |
+| `speed` | ~5-6ms | None (default; uses radar detection) |
+| `sound` | ~10μs | SEN-14262 + level shifter (legacy option) |
 | `sound-gpio` | ~1-18ms | SEN-14262 + GPIO wiring |
 | `polling` | ~300ms | None |
 

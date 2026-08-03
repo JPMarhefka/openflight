@@ -166,6 +166,283 @@ class TestFFTSize:
             radar.set_fft_size(64)
 
 
+class TestSpeedTriggerConfiguration:
+    """Tests for the fast club-speed trigger configuration."""
+
+    def test_uses_requested_threshold_and_fast_fft(self, monkeypatch):
+        """Hardware and software should share the same strict trigger floor."""
+        radar = OPS243Radar.__new__(OPS243Radar)
+        commands = []
+
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(radar, "_send_command", lambda command: commands.append(command) or "")
+        monkeypatch.setattr(radar, "set_units", lambda unit: commands.append(unit.value))
+        monkeypatch.setattr(radar, "set_transmit_power", lambda level: commands.append(f"P{level}"))
+        monkeypatch.setattr(radar, "set_sample_rate", lambda rate: commands.append(f"rate:{rate}"))
+        monkeypatch.setattr(
+            radar, "set_buffer_size", lambda size: commands.append(f"buffer:{size}")
+        )
+        monkeypatch.setattr(radar, "set_fft_size", lambda size: commands.append(f"fft:{size}"))
+        monkeypatch.setattr(
+            radar, "enable_json_output", lambda enabled: commands.append(f"json:{enabled}")
+        )
+        monkeypatch.setattr(
+            radar,
+            "enable_magnitude_report",
+            lambda enabled: commands.append(f"magnitude:{enabled}"),
+        )
+
+        radar.configure_for_speed_trigger(min_trigger_speed_mph=25)
+
+        assert commands == [
+            "GS",
+            "PI",
+            "US",
+            "P0",
+            "rate:30000",
+            "buffer:128",
+            "fft:2",
+            "R-",
+            "R>25",
+            "json:True",
+            "magnitude:True",
+            "W0",
+            "PA",
+            "S?",
+        ]
+
+    def test_switch_uses_full_post_trigger_buffer_at_30ksps(self, monkeypatch):
+        """The transition must use S#0 and retain the 30 ksps sample rate."""
+        radar = OPS243Radar.__new__(OPS243Radar)
+        commands = []
+        sleeps = []
+
+        monkeypatch.setattr(time, "sleep", sleeps.append)
+        monkeypatch.setattr(radar, "_send_command", lambda command: commands.append(command))
+        monkeypatch.setattr(radar, "set_sample_rate", lambda rate: commands.append(f"rate:{rate}"))
+
+        radar.switch_to_rolling_buffer()
+
+        assert commands == ["GC", "S#0", "rate:30000"]
+        assert sleeps == [0.02, 0.02, 0.02]
+
+    def test_hardware_trigger_reader_keeps_sz_records_after_q_array(self, monkeypatch):
+        """Hardware-trigger reads must not stop at the end of the Q array."""
+        radar = OPS243Radar.__new__(OPS243Radar)
+        radar._continuous_sampling_processing_enabled = True
+
+        class FakeSerial:
+            is_open = True
+
+            def __init__(self):
+                self.chunks = [
+                    b'{"ContinuousSampling":"Process Continuous Sampling Raw Data enabled"}\n'
+                    b'{"sample_time":1.0}\n{"trigger_time":1.1}\n{"I":[1]}\n{"Q":[2]}\n',
+                    b'{"time":1.12,"unit":"mph","magnitude":[100],"speed":[35]}\n',
+                    b'{"WindowFunction":"Generated Hann Window"}\n',
+                    b'{"windowing_amplitude_correction_factor":2.0020}\n',
+                ]
+
+            @property
+            def in_waiting(self):
+                return 1 if self.chunks else 0
+
+            def read(self, _size):
+                return self.chunks.pop(0)
+
+            def reset_input_buffer(self):
+                pass
+
+        radar.serial = FakeSerial()
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+        response = radar.wait_for_hardware_trigger(timeout=1.0, dump_grace=1.0)
+
+        assert '"Q":[2]' in response
+        assert '"speed":[35]' in response
+        assert '"windowing_amplitude_correction_factor":2.002' in response
+
+    def test_iq_only_reader_uses_q_as_end_marker(self, monkeypatch):
+        """Sz/I-Q-only responses can finish immediately after Q."""
+        radar = OPS243Radar.__new__(OPS243Radar)
+        radar._continuous_sampling_processing_enabled = False
+
+        class FakeSerial:
+            is_open = True
+
+            def __init__(self):
+                self.chunks = [
+                    b'{"ContinuousSampling":"Process Continuous Sampling Raw Data disabled"}\n'
+                    b'{"Q":[2]}',
+                    b'{"time":1.12,"unit":"mph","magnitude":[100],"speed":[35]}\n',
+                ]
+
+            @property
+            def in_waiting(self):
+                return 1 if self.chunks else 0
+
+            def read(self, _size):
+                return self.chunks.pop(0)
+
+            def reset_input_buffer(self):
+                pass
+
+        radar.serial = FakeSerial()
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+        response = radar.wait_for_hardware_trigger(timeout=1.0, dump_grace=1.0)
+
+        assert '"Q":[2]' in response
+        assert '"speed":[35]' not in response
+
+    def test_internal_trigger_uses_board_required_sequence(self, monkeypatch):
+        """Built-in ST trigger must not inherit the old GS/PA/S#0 lifecycle."""
+        radar = OPS243Radar.__new__(OPS243Radar)
+        commands = []
+
+        class FakeSerial:
+            is_open = True
+
+            def __init__(self):
+                self.writes = []
+
+            def reset_input_buffer(self):
+                pass
+
+            def write(self, value):
+                self.writes.append(value)
+
+            def flush(self):
+                pass
+
+        radar.serial = FakeSerial()
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(radar, "_send_command", lambda command: commands.append(command) or "")
+
+        radar.configure_for_internal_speed_trigger(
+            trigger_threshold_mph=25,
+            pre_trigger_segments=16,
+        )
+
+        assert commands == [
+            "PI", "GC", "S=30",
+            "US", "P0", "S(", "X=2", "R-", "R>25", "OJ", "OM", "W0", "S#16",
+        ]
+        assert radar.serial.writes == [b"ST25\r", b"ST25\r", b"SM40\r"]
+        assert not {"GS", "PA", "S#0"} & set(commands)
+
+    def test_internal_trigger_can_enable_sz_processing_after_configuration(self, monkeypatch):
+        """SZ is applied after GC resets and restores rolling-buffer settings."""
+        radar = OPS243Radar.__new__(OPS243Radar)
+        commands = []
+
+        class FakeSerial:
+            is_open = True
+
+            def reset_input_buffer(self):
+                pass
+
+            def write(self, _value):
+                pass
+
+            def flush(self):
+                pass
+
+        radar.serial = FakeSerial()
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(radar, "_send_command", lambda command: commands.append(command) or "")
+
+        radar.configure_for_internal_speed_trigger(process_continuous_sampling=True)
+
+        assert commands[-1] == "SZ"
+        assert radar._continuous_sampling_processing_enabled is True
+
+    def test_internal_trigger_rearm_restores_gc_reset_detector_settings(self, monkeypatch):
+        """Every GC re-arm restores the board settings that GC clears."""
+        radar = OPS243Radar.__new__(OPS243Radar)
+        commands = []
+
+        class FakeSerial:
+            is_open = True
+
+            def __init__(self):
+                self.writes = []
+
+            def reset_input_buffer(self):
+                pass
+
+            def write(self, value):
+                self.writes.append(value)
+
+            def flush(self):
+                pass
+
+        radar.serial = FakeSerial()
+        radar._internal_speed_trigger_config = (25.0, 16, 40, 30)
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(radar, "_send_command", lambda command: commands.append(command) or "")
+
+        radar.rearm_internal_speed_trigger()
+
+        assert radar.serial.writes == [b"GC", b"ST25\r", b"SM40\r"]
+        assert commands == [
+            "S=30", "US", "P0", "S(", "X=2", "R-", "R>25", "OJ", "OM", "W0", "S#16",
+        ]
+        assert not {"PI", "GS", "PA", "S#0"} & set(commands)
+
+
+class TestNonblockingSpeedRead:
+    """Tests for fragmented UART speed reports in speed-trigger mode."""
+
+    class _ChunkedSerial:
+        def __init__(self, chunks):
+            self.is_open = True
+            self._chunks = list(chunks)
+
+        @property
+        def in_waiting(self):
+            return len(self._chunks[0]) if self._chunks else 0
+
+        def read(self, _count):
+            return self._chunks.pop(0)
+
+    class _ClosedDuringPollSerial:
+        is_open = True
+
+        @property
+        def in_waiting(self):
+            raise OSError(9, "Bad file descriptor")
+
+    @staticmethod
+    def _radar_with_serial(serial):
+        radar = OPS243Radar.__new__(OPS243Radar)
+        radar.serial = serial
+        radar._json_mode = True
+        radar._unit = "mph"
+        radar._magnitude_enabled = True
+        radar._speed_read_buffer = ""
+        return radar
+
+    def test_retains_partial_json_until_the_full_report_arrives(self):
+        """UART chunks must not be parsed before the JSON line is complete."""
+        radar = self._radar_with_serial(
+            self._ChunkedSerial([b'{"magnitude":', b'[500],"speed":[-30.5]}\r\n'])
+        )
+
+        assert radar.read_speed_nonblocking() is None
+        reading = radar.read_speed_nonblocking()
+
+        assert reading is not None
+        assert reading.speed == pytest.approx(30.5)
+        assert reading.direction == Direction.OUTBOUND
+
+    def test_closed_serial_poll_is_treated_as_no_reading(self):
+        """Shutdown may close the port between the open check and in_waiting."""
+        radar = self._radar_with_serial(self._ClosedDuringPollSerial())
+
+        assert radar.read_speed_nonblocking() is None
+
+
 class TestSpeedReading:
     """Tests for SpeedReading dataclass."""
 
@@ -375,6 +652,69 @@ class _ScheduledSerial:
         chunk = released[self._consumed : self._consumed + n]
         self._consumed += len(chunk)
         return chunk
+
+
+class TestTriggerCapture:
+    """Tests for direct S! rolling-buffer reads."""
+
+    class _RetrySerial:
+        is_open = True
+
+        def __init__(self, payload, failures=1):
+            self.payload = payload
+            self.failures = failures
+            self.read_calls = 0
+
+        def reset_input_buffer(self):
+            return None
+
+        def write(self, _data):
+            return None
+
+        def flush(self):
+            return None
+
+        @property
+        def in_waiting(self):
+            return len(self.payload)
+
+        def read(self, _count):
+            self.read_calls += 1
+            if self.read_calls <= self.failures:
+                import serial
+
+                raise serial.SerialException("device reports readiness to read but returned no data")
+            return self.payload
+
+    def test_retries_multiple_transient_empty_serial_reads(self, monkeypatch):
+        """A pyserial readiness race should not crash a complete I/Q dump."""
+        radar = OPS243Radar.__new__(OPS243Radar)
+        radar.serial = self._RetrySerial(b'{"Q":[1]}', failures=3)
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+        response = radar.trigger_capture(timeout=1.0)
+
+        assert response == '{"Q":[1]}'
+        assert radar.serial.read_calls == 4
+        assert radar.last_capture_receive_error is None
+
+    def test_retries_serial_read_failures_until_capture_deadline(self, monkeypatch):
+        """Persistent read races end at timeout rather than an arbitrary retry cap."""
+        radar = OPS243Radar.__new__(OPS243Radar)
+        radar.serial = self._RetrySerial(b'{"Q":[1]}', failures=999)
+        now = [0.0]
+
+        def fake_time():
+            now[0] += 0.01
+            return now[0]
+
+        monkeypatch.setattr(time, "time", fake_time)
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+        assert radar.trigger_capture(timeout=0.05) == ""
+        assert radar.serial.read_calls > 1
+        assert now[0] >= 0.05
+        assert "readiness" in radar.last_capture_receive_error
 
 
 class TestWaitForHardwareTrigger:

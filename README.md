@@ -36,7 +36,7 @@ OpenFlight is an open-source golf launch monitor that uses Doppler radar to meas
 | OPS243-A Radar | Ball speed, club speed, spin | $249 |
 | Raspberry Pi 5 | Runs everything | $130 |
 | 7" Touchscreen | Shows shot data | $46 |
-| SparkFun SEN-14262 | Impact sound trigger for shot capture | $18 |
+| SparkFun SEN-14262 (optional) | Legacy impact sound trigger | $18 |
 | Power supply + accessories | | $27 |
 | **Subtotal, no angle radar** | | **~$400** |
 | TI IWR6843LEVM + cable | Launch angle (vertical + horizontal), club path | $156 |
@@ -59,7 +59,10 @@ See the **[Parts List](docs/PARTS.md)** for everything you need with purchase li
 
 ### 2. Wire it up
 
-Follow the **[Sound Trigger Wiring Guide](docs/sound-trigger-wiring.md)** to connect the SEN-14262 to the OPS243-A. The (deprecated) K-LD7 modules connect via USB — no wiring needed.
+Connect the OPS243-A by USB. The default trigger uses the radar's internal speed
+reports and needs no separate sound sensor. If you use the legacy SEN-14262,
+follow the **[Sound Trigger Wiring Guide](docs/sound-trigger-wiring.md)**. The
+(deprecated) K-LD7 modules connect via USB — no wiring needed.
 
 **Adding the IWR6843 angle radar?** The Pi cannot power both radars over USB, so
 the OPS243 moves to the Pi's GPIO UART header while the TI board takes the USB
@@ -92,7 +95,7 @@ details and troubleshooting.
 ### 4. Hit balls
 
 ```bash
-# Default: rolling buffer mode with sound trigger
+# Default: OPS243 internal >25 mph trigger with an S#16 rolling buffer
 scripts/start-kiosk.sh
 
 # With the IWR6843 angle radar (OPS243 on the Pi GPIO UART).
@@ -170,8 +173,8 @@ This is browser/tab casting only. OpenFlight does not include native Cast SDK su
 └─────────────┘
 ```
 
-1. **Sound trigger fires** — SEN-14262 detects club impact, triggers OPS243-A HOST_INT
-2. **OPS243-A dumps buffer** — Rolling buffer I/Q data is captured and analyzed for ball speed, club speed, and spin
+1. **OPS243 detects club speed** — its internal `ST25` threshold starts the shot sequence
+2. **OPS243-A captures the window** — the board dumps a full 4,096-sample `S#16` I/Q buffer (~136.5 ms at 30 ksps)
 3. **K-LD7 correlates** — The server uses the OPS243-A impact timestamp to find the matching ball burst in the K-LD7 ring buffer, extracting launch angle and club path
 4. **Carry computed** — Ball speed + spin + launch angle → carry distance
 5. **UI updates** — Shot data emitted via WebSocket to the React frontend
@@ -202,7 +205,8 @@ The K-LD7 modules are positioned near the OPS243-A, one mounted vertically (laun
 | Mode           | Rolling buffer         | Raw I/Q capture for spin + precise speeds    |
 | Sample Rate    | 30 ksps                | Supports up to ~208 mph ball speed           |
 | Capture        | 4096 I/Q samples       | ~136 ms around impact                        |
-| Trigger        | Sound (SEN-14262)      | ~10 µs hardware latency via HOST_INT         |
+| Speed Watch    | 128 samples, `X=2`     | Fast normal-mode club reports                |
+| Trigger        | Outbound speed >25 mph | No external sound hardware required          |
 | Min Ball Speed | 35 mph                 | Filter club waggle and slow movements        |
 | DC Mask        | ~15 mph exclusion zone | Reject body movement and environmental noise |
 
