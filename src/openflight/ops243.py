@@ -1568,6 +1568,41 @@ class OPS243Radar:
 
         return full_response
 
+    def _drain_rearm_serial(self):
+        """Drain trailing capture output before sending re-arm commands."""
+        # A full I/Q dump can still be in the driver buffer when the final
+        # metadata record is observed.  Wait for a quiet gap, but never let a
+        # continuously-chatty radar hold the monitor thread forever.
+        drain_budget = self.transfer_budget_s(floor=self.REARM_DRAIN_TIMEOUT_S)
+        drain_start = time.time()
+        total_drained = 0
+        drain_tail = b""
+        drain_timed_out = False
+        while True:
+            waiting = getattr(self.serial, "in_waiting", 0)
+            if waiting:
+                chunk = self.serial.read(waiting)
+                total_drained += len(chunk)
+                drain_tail = (drain_tail + chunk)[-200:]
+            time.sleep(0.2)
+            if getattr(self.serial, "in_waiting", 0) == 0:
+                break
+            if time.time() - drain_start > drain_budget:
+                drain_timed_out = True
+                break
+        if drain_timed_out:
+            logger.warning(
+                "[OPS] Re-arm drain timed out after %.1fs (%d bytes and still "
+                "streaming) — radar is continuously sending. Last bytes: %r",
+                drain_budget,
+                total_drained,
+                drain_tail.decode("ascii", errors="replace"),
+            )
+        else:
+            logger.info(
+                "[OPS] Re-arm drain: %d bytes in %.1fs", total_drained, time.time() - drain_start
+            )
+
     def rearm_rolling_buffer(self, pre_trigger_segments: int = 16):
         """
         Re-arm rolling buffer for next capture.
@@ -1586,46 +1621,7 @@ class OPS243Radar:
         if not self.serial or not self.serial.is_open:
             raise ConnectionError("Not connected to radar")
 
-        # Drain the serial buffer until no new bytes arrive for 200ms.
-        # A full I/Q dump is ~41KB at 57600 baud (~7s). If the previous
-        # capture wasn't fully read, bytes are still streaming in.
-        # Bounded: if the radar streams continuously (immediate re-triggers
-        # or a fallback into streaming mode), an unbounded drain hangs the
-        # monitor thread forever with nothing logged and the radar never
-        # re-armed. Bail out loudly instead, keeping a tail sample of the
-        # traffic so the log identifies WHAT the radar was sending.
-        # The budget is a floor scaled by baud: unchanged over USB and over
-        # UART at 230,400 (dump ~1.8s), but a 19,200 link needs ~21s just to
-        # finish one straggling dump and would otherwise trip this every time.
-        drain_budget = self.transfer_budget_s(floor=self.REARM_DRAIN_TIMEOUT_S)
-        drain_start = time.time()
-        total_drained = 0
-        drain_tail = b""
-        drain_timed_out = False
-        while True:
-            waiting = self.serial.in_waiting
-            if waiting:
-                chunk = self.serial.read(waiting)
-                total_drained += len(chunk)
-                drain_tail = (drain_tail + chunk)[-200:]
-            time.sleep(0.2)
-            if self.serial.in_waiting == 0:
-                break
-            if time.time() - drain_start > drain_budget:
-                drain_timed_out = True
-                break
-        if drain_timed_out:
-            logger.warning(
-                "[OPS] Re-arm drain timed out after %.1fs (%d bytes and still "
-                "streaming) — radar is continuously sending. Last bytes: %r",
-                drain_budget,
-                total_drained,
-                drain_tail.decode("ascii", errors="replace"),
-            )
-        else:
-            logger.info(
-                "[OPS] Re-arm drain: %d bytes in %.1fs", total_drained, time.time() - drain_start
-            )
+        self._drain_rearm_serial()
 
         pre_trigger_segments = max(0, min(32, pre_trigger_segments))
         try:
@@ -1654,8 +1650,9 @@ class OPS243Radar:
             )
             return
 
-        if getattr(self, "_continuous_sampling_processing_enabled", False):
-            self.set_continuous_sampling_processing(True)
+        self.set_continuous_sampling_processing(
+            bool(getattr(self, "_continuous_sampling_processing_enabled", False))
+        )
         self.serial.reset_input_buffer()
         logger.info("[OPS] Rolling buffer re-armed (S#%d)", pre_trigger_segments)
 
@@ -1703,8 +1700,7 @@ class OPS243Radar:
             sample_rate_ksps,
         )
         self._restore_internal_speed_trigger_settings()
-        if process_continuous_sampling:
-            self.set_continuous_sampling_processing(True)
+        self.set_continuous_sampling_processing(process_continuous_sampling)
         self.serial.reset_input_buffer()
 
         # A complete 4,096-sample rolling buffer needs 136.5 ms at 30 ksps.
@@ -1743,33 +1739,67 @@ class OPS243Radar:
         self.serial.flush()
         time.sleep(0.1)
 
-    def rearm_internal_speed_trigger(self, sample_rate_ksps: int = 30):
+    def rearm_internal_speed_trigger(self, sample_rate_ksps: int = 30) -> bool:
         """Re-arm the board-managed trigger after its complete I/Q dump.
 
         The board firmware resumes internal rolling-buffer trigger mode on
         ``GC``, but GC resets detector settings. Restore the cached hardware
         trigger configuration afterward; never send ``PA`` or ``S#0``.
+
+        SZ processing is stopped while GC and the detector settings are
+        restored.  The board can still be finishing the SZ metadata stream
+        when the final capture record arrives, and accepting commands during
+        that interval can produce a serial write timeout.  A failed re-arm is
+        reported to the caller but does not discard the capture that was just
+        received.
         """
         if not self.serial or not self.serial.is_open:
             raise ConnectionError("Not connected to radar")
         if sample_rate_ksps <= 0:
             raise ValueError("Sample rate must be positive")
 
-        self.serial.reset_input_buffer()
-        self.serial.write(b"GC")
-        self.serial.flush()
-        if hasattr(self, "_internal_speed_trigger_config"):
-            self._restore_internal_speed_trigger_settings()
-        else:
+        process_continuous_sampling = bool(
+            getattr(self, "_continuous_sampling_processing_enabled", False)
+        )
+        try:
+            # Let any bytes emitted after the final SZ metadata record drain
+            # before changing the board mode.  This is bounded for the same
+            # reason as the standard rolling-buffer re-arm path.
+            self._drain_rearm_serial()
+
+            # Stop SZ before GC and repeat it after GC because GC can restore
+            # firmware defaults.  Keeping SZ off during restoration prevents
+            # the board from competing with S=30 and the other commands.
+            self.set_continuous_sampling_processing(False)
+            self._drain_rearm_serial()
+            self.serial.reset_input_buffer()
+            self.serial.write(b"GC")
+            self.serial.flush()
+            time.sleep(0.15)
+            self.set_continuous_sampling_processing(False)
+            if hasattr(self, "_internal_speed_trigger_config"):
+                self._restore_internal_speed_trigger_settings()
+            else:
+                logger.warning(
+                    "[OPS] Internal trigger re-armed without cached configuration; "
+                    "GC defaults remain active"
+                )
+            self.set_continuous_sampling_processing(process_continuous_sampling)
+        except serial.SerialTimeoutException as error:
+            # A busy radar must not turn one valid capture into a monitor
+            # crash.  The next trigger cycle can retry the re-arm sequence.
+            self._continuous_sampling_processing_enabled = False
             logger.warning(
-                "[OPS] Internal trigger re-armed without cached configuration; "
-                "GC defaults remain active"
+                "[OPS] Internal trigger re-arm write timed out — capture retained; "
+                "re-arm will be retried after the next capture cycle: %s",
+                error,
             )
-        if getattr(self, "_continuous_sampling_processing_enabled", False):
-            self.set_continuous_sampling_processing(True)
+            return False
+
         # Let the newly armed rolling history fill before a club can trigger.
         time.sleep((4096 / (sample_rate_ksps * 1000)) + 0.05)
         logger.info("[OPS] Internal speed trigger re-armed (GC)")
+        return True
 
     def configure_for_rolling_buffer(
         self,
@@ -1810,8 +1840,7 @@ class OPS243Radar:
         self.enter_rolling_buffer_mode(
             pre_trigger_segments=pre_trigger_segments, sample_rate_ksps=sample_rate_ksps
         )
-        if process_continuous_sampling:
-            self.set_continuous_sampling_processing(True)
+        self.set_continuous_sampling_processing(process_continuous_sampling)
 
         logger.info("[OPS] Rolling buffer mode configured")
 
@@ -1927,8 +1956,7 @@ class OPS243Radar:
         # 30ksps sample rate (GC may reset to default)
         self.set_sample_rate(30000)
         time.sleep(0.02)
-        if process_continuous_sampling:
-            self.set_continuous_sampling_processing(True)
+        self.set_continuous_sampling_processing(process_continuous_sampling)
 
     def read_speed_nonblocking(self) -> Optional[SpeedReading]:
         """

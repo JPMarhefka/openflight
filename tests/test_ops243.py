@@ -3,6 +3,7 @@
 import time
 
 import pytest
+import serial
 
 from openflight.ops243 import Direction, OPS243Radar, SpeedReading
 
@@ -223,7 +224,7 @@ class TestSpeedTriggerConfiguration:
 
         radar.switch_to_rolling_buffer()
 
-        assert commands == ["GC", "S#0", "rate:30000"]
+        assert commands == ["GC", "S#0", "rate:30000", "Sz"]
         assert sleeps == [0.02, 0.02, 0.02]
 
     def test_hardware_trigger_reader_keeps_sz_records_after_q_array(self, monkeypatch):
@@ -326,7 +327,7 @@ class TestSpeedTriggerConfiguration:
 
         assert commands == [
             "PI", "GC", "S=30",
-            "US", "P0", "S(", "X=2", "R-", "R>25", "OJ", "OM", "W0", "S#16",
+            "US", "P0", "S(", "X=2", "R-", "R>25", "OJ", "OM", "W0", "S#16", "Sz",
         ]
         assert radar.serial.writes == [b"ST25\r", b"ST25\r", b"SM40\r"]
         assert not {"GS", "PA", "S#0"} & set(commands)
@@ -386,9 +387,75 @@ class TestSpeedTriggerConfiguration:
 
         assert radar.serial.writes == [b"GC", b"ST25\r", b"SM40\r"]
         assert commands == [
-            "S=30", "US", "P0", "S(", "X=2", "R-", "R>25", "OJ", "OM", "W0", "S#16",
+            "Sz", "Sz", "S=30", "US", "P0", "S(", "X=2", "R-", "R>25", "OJ", "OM", "W0", "S#16", "Sz",
         ]
         assert not {"PI", "GS", "PA", "S#0"} & set(commands)
+
+    def test_internal_trigger_rearm_restores_sz_when_enabled(self, monkeypatch):
+        """A successful GC re-arm restores SZ after detector settings."""
+        radar = OPS243Radar.__new__(OPS243Radar)
+        commands = []
+
+        class FakeSerial:
+            is_open = True
+
+            def __init__(self):
+                self.writes = []
+
+            def reset_input_buffer(self):
+                pass
+
+            def write(self, value):
+                self.writes.append(value)
+
+            def flush(self):
+                pass
+
+        radar.serial = FakeSerial()
+        radar._continuous_sampling_processing_enabled = True
+        radar._internal_speed_trigger_config = (25.0, 16, 40, 30)
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(radar, "_send_command", lambda command: commands.append(command) or "")
+
+        assert radar.rearm_internal_speed_trigger() is True
+
+        assert commands[:2] == ["Sz", "Sz"]
+        assert commands[-1] == "SZ"
+        assert radar._continuous_sampling_processing_enabled is True
+
+    def test_internal_trigger_rearm_keeps_capture_when_write_times_out(self, monkeypatch):
+        """A busy radar must not discard a capture because GC restoration times out."""
+        radar = OPS243Radar.__new__(OPS243Radar)
+        commands = []
+
+        class FakeSerial:
+            is_open = True
+
+            def reset_input_buffer(self):
+                pass
+
+            def write(self, _value):
+                pass
+
+            def flush(self):
+                pass
+
+        radar.serial = FakeSerial()
+        radar._continuous_sampling_processing_enabled = True
+        radar._internal_speed_trigger_config = (25.0, 16, 40, 30)
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+        def send_command(command):
+            commands.append(command)
+            if command == "S=30":
+                raise serial.SerialTimeoutException("write timeout")
+            return ""
+
+        monkeypatch.setattr(radar, "_send_command", send_command)
+
+        assert radar.rearm_internal_speed_trigger() is False
+        assert commands == ["Sz", "Sz", "S=30"]
+        assert radar._continuous_sampling_processing_enabled is False
 
 
 class TestNonblockingSpeedRead:
