@@ -41,7 +41,7 @@ def test_iwr6843_enables_ti_launch_pipeline_with_production_defaults():
     command = result.stdout.strip()
 
     assert "--iwr6843" in command
-    assert "--trigger sound" in command
+    assert "--trigger hardware" in command
     assert "--kld7" not in command
 
 
@@ -203,7 +203,7 @@ def test_hotspot_configuration_is_opt_in_and_persistent():
     assert 'HOTSPOT_SSID="Launch_Dev"' in script
     assert "HOTSPOT_PASSWORD='Jetson1$'" in script
     assert 'HOTSPOT_ADDRESS="10.42.0.1/24"' in script
-    assert 'nmcli connection up "$HOTSPOT_CONNECTION"' in script
+    assert 'nmcli_run connection up "$HOTSPOT_CONNECTION"' in script
     assert "nmcli connection down" not in script
 
 
