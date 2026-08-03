@@ -3,11 +3,13 @@
 import importlib.util
 import json
 import struct
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
+from openflight.launch_monitor import ClubType, Shot
 from openflight.rolling_buffer import (
     BoardProcessedTimeline,
     BoardSpeedMagnitudeRecord,
@@ -22,6 +24,7 @@ from openflight.sigmf_capture import (
     OPS243_CENTER_FREQUENCY_HZ,
     _iq_text_bytes,
     create_kiosk_session_directory,
+    update_kiosk_sigmf_metadata,
     write_kiosk_sigmf_hit,
     write_sigmf_recording,
 )
@@ -57,6 +60,7 @@ def _result() -> SpeedTriggeredCaptureResult:
         response_bytes=1234,
         capture_latency_ms=250.0,
         trigger_threshold_mph=25.0,
+        trigger_type="speed",
     )
 
 
@@ -81,6 +85,7 @@ def test_sigmf_recording_preserves_interleaved_iq_and_metadata(tmp_path):
     assert template["captures"][0]["core:frequency"] == OPS243_CENTER_FREQUENCY_HZ
     assert capture["core:frequency"] == template["captures"][0]["core:frequency"]
     assert capture["openflight:sample_count"] == 3
+    assert capture["openflight:trigger_type"] == "speed"
     assert capture["openflight:trigger_speed_mph"] == 42.5
     assert capture["openflight:trigger_threshold_mph"] == 25.0
 
@@ -122,11 +127,13 @@ def test_hardware_sigmf_recording_omits_unreported_trigger_speed(tmp_path):
         response_bytes=1234,
         capture_latency_ms=250.0,
         trigger_threshold_mph=25.0,
+        trigger_type="hardware",
     )
 
     _, meta_path = write_sigmf_recording(tmp_path, TEMPLATE_PATH, 1, result)
     capture = json.loads(meta_path.read_text())["captures"][0]
 
+    assert capture["openflight:trigger_type"] == "hardware"
     assert "openflight:trigger_speed_mph" not in capture
     assert capture["openflight:trigger_threshold_mph"] == 25.0
 
@@ -186,9 +193,28 @@ def test_kiosk_hit_directory_contains_sigmf_pair_and_raw_iq_text(tmp_path):
     assert "speed -0.700 mps" not in preview
     assert "Mag1" in preview and "Mag5" in preview
     assert "highest magnitude → lowest" in preview
+
+    update_kiosk_sigmf_metadata(
+        meta_path,
+        Shot(
+            ball_speed_mph=70.2,
+            timestamp=datetime.now(),
+            club_speed_mph=66.5,
+            club=ClubType.DRIVER,
+            spin_rpm=5603.0,
+            spin_result_quality="experimental",
+        ),
+        1,
+    )
     index = (session_dir / "index.html").read_text()
     assert SHOT_PREVIEW_FILENAME in index
     assert "Mag1 is highest magnitude and Mag5 is lowest" in index
+    assert "Trigger / threshold" in index
+    assert "42.5 mph (speed)" in index
+    assert "70.2 mph" in index
+    assert "66.5 mph" in index
+    assert "5603 RPM (experimental)" in index
+    assert "95.5 yd" in index
     assert data_path.parent == meta_path.parent == text_path.parent == hit_dir
     assert struct.unpack("<6h", data_path.read_bytes()) == (0, 4095, 2048, 2048, 4095, 0)
     assert text_path.read_text() == "I:0,2048,4095\n\nQ:4095,2048,0\n"
@@ -207,6 +233,19 @@ def test_kiosk_hit_directory_contains_sigmf_pair_and_raw_iq_text(tmp_path):
     assert capture_metadata["openflight:board_preview_color_encoding"] == (
         "array_position_1_to_5; Mag1 highest magnitude, Mag5 lowest magnitude"
     )
+
+
+def test_kiosk_index_uses_hardware_threshold_without_actual_trigger_speed(tmp_path):
+    """Hardware-triggered hits show the configured threshold, not a fake speed."""
+    result = _result()
+    result.trigger_speed_mph = None
+    result.trigger_type = "hardware"
+    session_dir = create_kiosk_session_directory(tmp_path, 1_700_000_000.0)
+
+    write_kiosk_sigmf_hit(session_dir, TEMPLATE_PATH, 1, result)
+
+    index = (session_dir / "index.html").read_text()
+    assert "&gt;25.0 mph (hardware)" in index
 
 
 def test_kiosk_session_directories_are_unique_for_same_start_second(tmp_path):

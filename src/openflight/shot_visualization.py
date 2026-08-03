@@ -267,6 +267,17 @@ def _session_rows(session_dir: Path) -> list[dict[str, Any]]:
             {
                 "name": hit_dir.name,
                 "shot_number": capture.get("openflight:shot_number"),
+                "trigger_type": capture.get("openflight:trigger_type"),
+                "trigger_speed": capture.get("openflight:trigger_speed_mph"),
+                "trigger_threshold": capture.get("openflight:trigger_threshold_mph"),
+                "ball_speed": capture.get("openflight:ball_speed_mph"),
+                "club_speed": capture.get("openflight:club_speed_mph"),
+                "spin_rpm": capture.get("openflight:spin_rpm"),
+                "spin_quality": capture.get("openflight:spin_quality"),
+                "carry": capture.get(
+                    "openflight:estimated_carry_ui_yards",
+                    capture.get("openflight:carry_yards"),
+                ),
                 "unit": capture.get("openflight:board_unit") or "native units",
                 "records": capture.get("openflight:board_record_count", 0),
                 "points": capture.get("openflight:board_point_count", "—"),
@@ -285,6 +296,41 @@ def _display(value: Any) -> str:
     return str(value)
 
 
+def _metric_display(value: Any, unit: str, digits: int = 2) -> str:
+    """Format an optional numeric summary with its display unit."""
+    if value is None:
+        return "—"
+    if isinstance(value, float):
+        value_display = f"{value:.1f}" if digits == 1 else _format_number(value, digits)
+    else:
+        value_display = str(value)
+    return f"{value_display} {unit}"
+
+
+def _trigger_display(row: dict[str, Any]) -> str:
+    """Show an actual host trigger speed or the hardware threshold."""
+    trigger_speed = row.get("trigger_speed")
+    trigger_threshold = row.get("trigger_threshold")
+    if trigger_speed is not None:
+        value = _metric_display(trigger_speed, "mph", digits=1)
+    elif trigger_threshold is not None:
+        value = f">{_metric_display(trigger_threshold, 'mph', digits=1)}"
+    else:
+        return "—"
+
+    trigger_type = row.get("trigger_type")
+    return f"{value} ({trigger_type})" if trigger_type else value
+
+
+def _spin_display(row: dict[str, Any]) -> str:
+    """Format spin RPM and retain the processor quality label when present."""
+    value = _metric_display(row.get("spin_rpm"), "RPM", digits=0)
+    quality = row.get("spin_quality")
+    if quality and value != "—":
+        return f"{value} ({quality})"
+    return value
+
+
 def _session_index_html(session_dir: Path) -> bytes:
     rows = _session_rows(session_dir)
     if rows:
@@ -293,15 +339,20 @@ def _session_index_html(session_dir: Path) -> bytes:
             f'<td><a href="{html.escape(row["name"] + "/" + SHOT_PREVIEW_FILENAME)}">{html.escape(row["name"])}</a>'
             f'<br><img loading="lazy" src="{html.escape(row["name"] + "/" + SHOT_PREVIEW_FILENAME)}" alt="{html.escape(row["name"])} preview"></td>'
             f'<td>{html.escape(_display(row["shot_number"]))}</td>'
+            f'<td>{html.escape(_trigger_display(row))}</td>'
+            f'<td>{html.escape(_metric_display(row["ball_speed"], "mph", digits=1))}</td>'
+            f'<td>{html.escape(_metric_display(row["club_speed"], "mph", digits=1))}</td>'
+            f'<td>{html.escape(_spin_display(row))}</td>'
+            f'<td>{html.escape(_metric_display(row["carry"], "yd", digits=1))}</td>'
             f'<td>{html.escape(_display(row["records"]))}</td>'
             f'<td>{html.escape(_display(row["points"]))}</td>'
-            f'<td>{html.escape(_display(row["peak_speed"]))} {html.escape(_display(row["unit"]))}</td>'
+            f'<td>{html.escape(_metric_display(row["peak_speed"], row["unit"]))}</td>'
             f'<td>{html.escape(_display(row["peak_magnitude"]))}</td>'
             "</tr>"
             for row in rows
         )
     else:
-        body_rows = ('<tr><td colspan="6" class="empty">No completed shot previews yet.</td></tr>',)
+        body_rows = ('<tr><td colspan="11" class="empty">No completed shot previews yet.</td></tr>',)
     session_title = html.escape(session_dir.name)
     document = f"""<!doctype html>
 <html lang="en">
@@ -311,7 +362,7 @@ def _session_index_html(session_dir: Path) -> bytes:
 <title>OpenFlight {session_title}</title>
 <style>
 body {{ font-family: system-ui, -apple-system, Segoe UI, sans-serif; color: #1f2937; margin: 2rem; background: #f3f4f6; }}
-main {{ max-width: 1180px; margin: auto; background: #fff; padding: 1.5rem 2rem 2rem; border: 1px solid #d1d5db; border-radius: 10px; }}
+main {{ max-width: 1500px; margin: auto; background: #fff; padding: 1.5rem 2rem 2rem; border: 1px solid #d1d5db; border-radius: 10px; }}
 h1 {{ margin-top: 0; font-size: 1.5rem; }}
 p {{ color: #4b5563; }}
 table {{ width: 100%; border-collapse: collapse; }}
@@ -326,9 +377,9 @@ img {{ display: block; width: 320px; max-width: 45vw; margin-top: .55rem; border
 <body><main>
 <h1>OpenFlight board speed / magnitude previews</h1>
 <p>Session: <code>{session_title}</code></p>
-<p class="note">Absolute speed is plotted on the Y-axis. Point color identifies the 1-based board array position: Mag1 is highest magnitude and Mag5 is lowest. Open a hit name for the full-size SVG.</p>
+<p class="note">Trigger shows the actual host trigger speed when available, otherwise the hardware threshold. Spin includes the processor quality label when present. Absolute board speed is plotted on the Y-axis; point color identifies the 1-based board array position: Mag1 is highest magnitude and Mag5 is lowest. Open a hit name for the full-size SVG.</p>
 <table>
-<thead><tr><th>Hit / preview</th><th>Shot</th><th>Board records</th><th>Paired points</th><th>Peak speed</th><th>Peak magnitude</th></tr></thead>
+<thead><tr><th>Hit / preview</th><th>Shot</th><th>Trigger / threshold</th><th>Ball speed</th><th>Club speed</th><th>Spin</th><th>Carry</th><th>Board records</th><th>Paired points</th><th>Peak speed</th><th>Peak magnitude</th></tr></thead>
 <tbody>{''.join(body_rows)}</tbody>
 </table>
 </main></body></html>

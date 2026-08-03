@@ -39,6 +39,7 @@ class RawCaptureResult:
     trigger_threshold_mph: Optional[float]
     failure_reason: Optional[str] = None
     board_timeline: Optional[BoardProcessedTimeline] = None
+    trigger_type: Optional[str] = None
 
 
 # Retained for callers that use the original speed-trigger public type.
@@ -629,6 +630,7 @@ class SpeedTriggeredCapture(TriggerStrategy):
                             capture_latency_ms=capture_latency_ms,
                             trigger_threshold_mph=self.min_trigger_speed_mph,
                             board_timeline=capture.board_timeline,
+                            trigger_type="speed",
                         )
                         if raw_capture_callback is not None:
                             try:
@@ -651,6 +653,7 @@ class SpeedTriggeredCapture(TriggerStrategy):
                             capture_latency_ms=capture_latency_ms,
                             trigger_threshold_mph=self.min_trigger_speed_mph,
                             failure_reason=reason,
+                            trigger_type="speed",
                         )
                 finally:
                     # The raw response is local by this point, so restore normal
@@ -1395,6 +1398,7 @@ class HardwareTriggeredCapture(SoundTrigger):
                 capture_latency_ms=capture_latency_ms,
                 trigger_threshold_mph=self.trigger_threshold_mph,
                 failure_reason="parse_failed",
+                trigger_type="hardware",
             )
 
         # Re-use the hardware-trigger timestamp refinement shared by the
@@ -1409,6 +1413,7 @@ class HardwareTriggeredCapture(SoundTrigger):
             capture_latency_ms=capture_latency_ms,
             trigger_threshold_mph=self.trigger_threshold_mph,
             board_timeline=capture.board_timeline,
+            trigger_type="hardware",
         )
         if raw_capture_callback is not None:
             try:

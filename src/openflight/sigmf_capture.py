@@ -222,10 +222,28 @@ def _sigmf_contents(
         # than a SigMF core field: it describes acquisition provenance, not
         # the signal encoding itself.
         static_capture["openflight:configuration"] = dict(configuration)
+
+    trigger_type = result.trigger_type
+    if trigger_type is None and configuration is not None:
+        configured_trigger_type = configuration.get("trigger") or configuration.get("trigger_type")
+        if configured_trigger_type is not None:
+            trigger_type = str(configured_trigger_type)
+    if trigger_type is not None:
+        static_capture["openflight:trigger_type"] = trigger_type
+
+    trigger_threshold_mph = result.trigger_threshold_mph
+    if trigger_threshold_mph is None and configuration is not None:
+        configured_threshold = configuration.get("trigger_threshold_mph")
+        if configured_threshold is None:
+            configured_threshold = configuration.get("trigger_threshold")
+        if isinstance(configured_threshold, (int, float)) and not isinstance(
+            configured_threshold, bool
+        ):
+            trigger_threshold_mph = float(configured_threshold)
     if result.trigger_speed_mph is not None:
         static_capture["openflight:trigger_speed_mph"] = result.trigger_speed_mph
-    if result.trigger_threshold_mph is not None:
-        static_capture["openflight:trigger_threshold_mph"] = result.trigger_threshold_mph
+    if trigger_threshold_mph is not None:
+        static_capture["openflight:trigger_threshold_mph"] = trigger_threshold_mph
     metadata["captures"] = [static_capture]
     return (
         _interleaved_iq_bytes(capture.i_samples, capture.q_samples),
