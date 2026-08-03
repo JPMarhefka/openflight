@@ -379,7 +379,7 @@ img {{ display: block; width: 320px; max-width: 45vw; margin-top: .55rem; border
 <p>Session: <code>{session_title}</code></p>
 <p class="note">Trigger shows the actual host trigger speed when available, otherwise the hardware threshold. Spin includes the processor quality label when present. Absolute board speed is plotted on the Y-axis; point color identifies the 1-based board array position: Mag1 is highest magnitude and Mag5 is lowest. Open a hit name for the full-size SVG.</p>
 <table>
-<thead><tr><th>Hit / preview</th><th>Shot</th><th>Trigger / threshold</th><th>Ball speed</th><th>Club speed</th><th>Spin</th><th>Carry</th><th>Board records</th><th>Paired points</th><th>Peak speed</th><th>Peak magnitude</th></tr></thead>
+<thead><tr><th>Hit / preview (OpenFlight)</th><th>Shot (OpenFlight)</th><th>Trigger / threshold (OPS243)</th><th>Ball speed (OpenFlight processor)</th><th>Club speed (OpenFlight processor)</th><th>Spin (OpenFlight processor)</th><th>Carry (OpenFlight model)</th><th>Board records (OPS243)</th><th>Paired points (OpenFlight)</th><th>Peak speed (OPS243)</th><th>Peak magnitude (OPS243)</th></tr></thead>
 <tbody>{''.join(body_rows)}</tbody>
 </table>
 </main></body></html>

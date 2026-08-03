@@ -9,13 +9,79 @@ import re
 from pathlib import Path
 
 
-def read_iq_txt(path: Path) -> tuple[list[int], list[int]]:
-    text = path.read_text(encoding="utf-8")
-    i_text, q_text = text.split("\n\nQ:", 1)
-    i_values = [int(v) for v in i_text.removeprefix("I:").replace("\n", ",").split(",") if v]
-    q_values = [int(v) for v in q_text.replace("\n", ",").split(",") if v]
+def read_iq_txt_with_metadata(
+    path: Path,
+) -> tuple[list[int], list[int], float | None, float | None]:
+    """Read native OPS243 or legacy OpenFlight I/Q text output.
+
+    Native dumps retain the OPS243 command header, ``Hg`` sample-start time,
+    ``Ht`` trigger time, and ``#%``-wrapped JSON fragments. The radar's JSON
+    arrays use a trailing comma, so that comma is removed before decoding.
+    """
+    lines = path.read_text(encoding="utf-8").splitlines()
+    sample_time = None
+    trigger_time = None
+    fragments: dict[str, list[str]] = {"I": [], "Q": []}
+    current_name: str | None = None
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if line.startswith("Hg"):
+            sample_time = float(line[2:])
+            continue
+        if line.startswith("Ht"):
+            trigger_time = float(line[2:])
+            continue
+        if not line.startswith("#%"):
+            continue
+
+        fragment = line[2:]
+        if fragment.startswith('{"I":['):
+            current_name = "I"
+        elif fragment.startswith('{"Q":['):
+            current_name = "Q"
+        if current_name is None:
+            continue
+
+        fragments[current_name].append(fragment)
+        if fragment.endswith("]}"):
+            current_name = None
+
+    if fragments["I"] and fragments["Q"]:
+        values: dict[str, list[int]] = {}
+        for name in ("I", "Q"):
+            payload = "".join(fragments[name]).replace(",]}", "]}", 1)
+            try:
+                decoded = json.loads(payload)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"Invalid OPS243 {name} array: {error}") from error
+            values[name] = [int(value) for value in decoded.get(name, [])]
+        i_values, q_values = values["I"], values["Q"]
+    else:
+        try:
+            text = path.read_text(encoding="utf-8")
+            i_text, q_text = text.split("\n\nQ:", 1)
+        except ValueError as error:
+            raise ValueError("I/Q text does not contain native OPS243 or legacy I:/Q: data") from error
+        i_values = [
+            int(value)
+            for value in i_text.removeprefix("I:").replace("\n", ",").split(",")
+            if value.strip()
+        ]
+        q_values = [
+            int(value)
+            for value in q_text.replace("\n", ",").split(",")
+            if value.strip()
+        ]
+
     if len(i_values) != len(q_values):
         raise ValueError(f"I/Q length mismatch: {len(i_values)} != {len(q_values)}")
+    return i_values, q_values, sample_time, trigger_time
+
+
+def read_iq_txt(path: Path) -> tuple[list[int], list[int]]:
+    """Read I/Q samples while preserving the original two-value API."""
+    i_values, q_values, _, _ = read_iq_txt_with_metadata(path)
     return i_values, q_values
 
 
@@ -28,10 +94,20 @@ def reprocess_hit(
     i_path = hit_dir / "iq.txt"
     metadata = json.loads(meta_path.read_text(encoding="utf-8"))
     capture_meta = metadata["captures"][0]
-    i_values, q_values = read_iq_txt(i_path)
+    i_values, q_values, file_sample_time, file_trigger_time = read_iq_txt_with_metadata(i_path)
+    sample_time = (
+        file_sample_time
+        if file_sample_time is not None
+        else float(capture_meta.get("openflight:sample_time", 0.0))
+    )
+    trigger_time = (
+        file_trigger_time
+        if file_trigger_time is not None
+        else float(capture_meta.get("openflight:trigger_time", 0.0))
+    )
     capture = IQCapture(
-        sample_time=float(capture_meta.get("openflight:sample_time", 0.0)),
-        trigger_time=float(capture_meta.get("openflight:trigger_time", 0.0)),
+        sample_time=sample_time,
+        trigger_time=trigger_time,
         i_samples=i_values,
         q_samples=q_values,
         first_byte_timestamp=capture_meta.get("openflight:host_trigger_timestamp"),

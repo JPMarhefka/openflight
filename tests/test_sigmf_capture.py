@@ -209,7 +209,10 @@ def test_kiosk_hit_directory_contains_sigmf_pair_and_raw_iq_text(tmp_path):
     index = (session_dir / "index.html").read_text()
     assert SHOT_PREVIEW_FILENAME in index
     assert "Mag1 is highest magnitude and Mag5 is lowest" in index
-    assert "Trigger / threshold" in index
+    assert "Trigger / threshold (OPS243)" in index
+    assert "Ball speed (OpenFlight processor)" in index
+    assert "Spin (OpenFlight processor)" in index
+    assert "Carry (OpenFlight model)" in index
     assert "42.5 mph (speed)" in index
     assert "70.2 mph" in index
     assert "66.5 mph" in index
@@ -217,7 +220,13 @@ def test_kiosk_hit_directory_contains_sigmf_pair_and_raw_iq_text(tmp_path):
     assert "95.5 yd" in index
     assert data_path.parent == meta_path.parent == text_path.parent == hit_dir
     assert struct.unpack("<6h", data_path.read_bytes()) == (0, 4095, 2048, 2048, 4095, 0)
-    assert text_path.read_text() == "I:0,2048,4095\n\nQ:4095,2048,0\n"
+    assert text_path.read_text() == (
+        "PIDHDIDKDLDV\n"
+        "Hg100.000000\n"
+        "Ht100.015000\n"
+        '#%{"I":[0,2048,4095,]}\n'
+        '#%{"Q":[4095,2048,0,]}\n'
+    )
     board_lines = [json.loads(line) for line in (hit_dir / BOARD_OUTPUT_FILENAME).read_text().splitlines()]
     assert board_lines[0]["record_count"] == 1
     assert board_lines[0]["processing_enabled"] is True
@@ -257,13 +266,21 @@ def test_kiosk_session_directories_are_unique_for_same_start_second(tmp_path):
     assert second.name == "session-20231114T221320Z-01"
 
 
-def test_iq_text_wraps_each_channel_after_13_values():
-    text = _iq_text_bytes(list(range(14)), list(range(100, 114))).decode()
+def test_iq_text_uses_ops243_format_and_wraps_each_channel_after_20_values():
+    text = _iq_text_bytes(
+        list(range(24)),
+        list(range(100, 124)),
+        sample_time=698.904,
+        trigger_time=698.954,
+    ).decode()
     assert text == (
-        "I:0,1,2,3,4,5,6,7,8,9,10,11,12\n"
-        "13\n\n"
-        "Q:100,101,102,103,104,105,106,107,108,109,110,111,112\n"
-        "113\n"
+        "PIDHDIDKDLDV\n"
+        "Hg698.904000\n"
+        "Ht698.954000\n"
+        '#%{"I":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,\n'
+        "#%20,21,22,23,]}\n"
+        '#%{"Q":[100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,\n'
+        "#%120,121,122,123,]}\n"
     )
 
 

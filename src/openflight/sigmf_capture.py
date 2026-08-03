@@ -23,6 +23,8 @@ OPS243_CENTER_FREQUENCY_HZ = 24_125_000_000
 logger = logging.getLogger("openflight.sigmf_capture")
 DEFAULT_TEMPLATE_PATH = Path(__file__).resolve().parents[2] / "config" / "ops243-iq.sigmf-meta"
 BOARD_OUTPUT_FILENAME = "board-speed-magnitude.jsonl"
+OPS243_IQ_COMMAND_HEADER = "PIDHDIDKDLDV"
+OPS243_IQ_VALUES_PER_LINE = 20
 
 
 def recording_basename(capture_index: int, trigger_timestamp: float) -> str:
@@ -143,21 +145,51 @@ def _interleaved_iq_bytes(i_samples: list[int], q_samples: list[int]) -> bytes:
     return struct.pack(f"<{len(samples)}h", *samples)
 
 
-def _iq_text_bytes(i_samples: list[int], q_samples: list[int]) -> bytes:
-    """Return raw ADC samples as separate comma-separated I and Q blocks."""
+def _iq_text_bytes(
+    i_samples: list[int],
+    q_samples: list[int],
+    sample_time: float | None = None,
+    trigger_time: float | None = None,
+) -> bytes:
+    """Return raw I/Q data in the OPS243 API dump format.
+
+    The command header and ``Hg``/``Ht`` lines mirror the radar's native
+    rolling-buffer response. ``#%`` prefixes are retained on every wrapped
+    JSON fragment so the text can be fed to tools that expect an OPS243 dump.
+    """
     if len(i_samples) != len(q_samples):
         raise ValueError("I and Q sample counts must match")
-    for i_value, q_value in zip(i_samples, q_samples):
-        if not 0 <= i_value <= 4095 or not 0 <= q_value <= 4095:
+    for value in [*i_samples, *q_samples]:
+        if not 0 <= value <= 4095:
             raise ValueError("OPS243 ADC samples must be 12-bit unsigned values")
-    def wrapped(values: list[int]) -> str:
-        lines = [
-            ",".join(str(value) for value in values[index : index + 13])
-            for index in range(0, len(values), 13)
-        ]
-        return "\n".join(lines)
 
-    return f"I:{wrapped(i_samples)}\n\nQ:{wrapped(q_samples)}\n".encode("utf-8")
+    def wrapped_json(name: str, values: list[int]) -> list[str]:
+        chunks = [
+            values[index : index + OPS243_IQ_VALUES_PER_LINE]
+            for index in range(0, len(values), OPS243_IQ_VALUES_PER_LINE)
+        ]
+        if not chunks:
+            return [f'#%{{"{name}":[]}}']
+        lines = []
+        for chunk_index, chunk in enumerate(chunks):
+            prefix = f'#%{{"{name}":[' if chunk_index == 0 else "#%"
+            values_text = ",".join(str(value) for value in chunk)
+            if chunk_index == len(chunks) - 1:
+                lines.append(f"{prefix}{values_text},]}}")
+            else:
+                lines.append(f"{prefix}{values_text},")
+        return lines
+
+    sample_time = 0.0 if sample_time is None else float(sample_time)
+    trigger_time = 0.0 if trigger_time is None else float(trigger_time)
+    lines = [
+        OPS243_IQ_COMMAND_HEADER,
+        f"Hg{sample_time:.6f}",
+        f"Ht{trigger_time:.6f}",
+        *wrapped_json("I", i_samples),
+        *wrapped_json("Q", q_samples),
+    ]
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 def _sigmf_contents(
@@ -328,7 +360,12 @@ def write_kiosk_sigmf_hit(
         configuration,
         board_output_file=BOARD_OUTPUT_FILENAME,
     )
-    text_content = _iq_text_bytes(result.capture.i_samples, result.capture.q_samples)
+    text_content = _iq_text_bytes(
+        result.capture.i_samples,
+        result.capture.q_samples,
+        sample_time=result.capture.sample_time,
+        trigger_time=result.capture.trigger_time,
+    )
     board_output_content = _board_output_bytes(result)
     preview_content = render_shot_preview_svg(
         result,
